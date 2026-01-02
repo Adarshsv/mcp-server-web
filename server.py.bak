@@ -16,14 +16,6 @@ ZENDESK_EMAIL = os.getenv("ZENDESK_EMAIL")
 ZENDESK_API_TOKEN = os.getenv("ZENDESK_API_TOKEN")
 ZENDESK_SUBDOMAIN = os.getenv("ZENDESK_SUBDOMAIN", "castsoftware")
 
-@app.get("/debug/env")
-def debug_env():
-    return {
-        "email": bool(ZENDESK_EMAIL),
-        "token": bool(ZENDESK_API_TOKEN),
-        "subdomain": ZENDESK_SUBDOMAIN,
-    }
-
 print("Zendesk email loaded:", bool(ZENDESK_EMAIL), file=sys.stderr)
 print("Zendesk API token loaded:", bool(ZENDESK_API_TOKEN), file=sys.stderr)
 # ----------------------------------------------
