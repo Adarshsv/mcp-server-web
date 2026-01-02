@@ -3,7 +3,7 @@ import sys
 import base64
 import httpx
 import asyncio
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
@@ -66,7 +66,7 @@ def summarize_comments(comments):
     if not comments:
         return ""
     snippets = []
-    for c in comments[:5]:  # limit to top 5 comments
+    for c in comments[:5]:  # top 5 comments
         body = c.get("plain_body") or c.get("body", "")
         if body:
             snippets.append(body.strip().replace("\n", " "))
@@ -80,7 +80,7 @@ def shorten_summary(text):
         shortened += " ..."
     return shortened
 
-# -------- Shared Helper: Build Summary --------
+# -------- Shared Helper: Build Summary ----------
 async def generate_summary(query=None, ticket_ids=None):
     related_tickets = []
     related_docs = []
@@ -105,6 +105,7 @@ async def generate_summary(query=None, ticket_ids=None):
             for c_resp in comments_responses:
                 comments = c_resp.json().get("comments", [])
                 summarized_comments += summarize_comments(comments) + " "
+
         elif query:
             # Search by keyword
             try:
@@ -114,8 +115,8 @@ async def generate_summary(query=None, ticket_ids=None):
                     params={"query": f"type:ticket {query}"}
                 )
                 resp.raise_for_status()
-                tickets = resp.json().get("results", [])
-                for t in tickets[:5]:
+                tickets = resp.json().get("results", [])[:5]
+                for t in tickets:
                     related_tickets.append({
                         "id": t["id"],
                         "subject": t["subject"],
@@ -126,7 +127,7 @@ async def generate_summary(query=None, ticket_ids=None):
                     client.get(
                         f"https://{ZENDESK_SUBDOMAIN}.zendesk.com/api/v2/tickets/{t['id']}/comments.json",
                         headers=headers
-                    ) for t in tickets[:5]
+                    ) for t in tickets
                 ])
                 for c_resp in comments_responses:
                     comments = c_resp.json().get("comments", [])
@@ -134,7 +135,7 @@ async def generate_summary(query=None, ticket_ids=None):
             except Exception:
                 pass
 
-        # -------- Fetch Related Docs --------
+        # -------- Fetch Related Docs via DuckDuckGo --------
         if query:
             try:
                 with DDGS() as ddgs:
@@ -204,13 +205,13 @@ def home():
         <title>MCP Web</title>
         <style>
             body { font-family: Arial, sans-serif; padding: 20px; max-width: 900px; margin: auto; }
-            input, button { padding: 8px; margin: 5px 0; width: 100%; }
-            .result { border: 1px solid #ccc; padding: 15px; margin-top: 20px; white-space: pre-wrap; }
+            input, button { padding: 8px; margin: 5px 0; width: 100%; max-width: 400px; }
+            .result { border: 1px solid #ccc; padding: 15px; margin-top: 20px; white-space: pre-wrap; background: #f9f9f9; }
             h2 { margin-top: 0; }
         </style>
     </head>
     <body>
-        <h2>MCP Web Ticket & Query Summarizer</h2>
+        <h2>CAST Support Assistant</h2>
         <label>Ticket ID (optional):</label>
         <input type="number" id="ticket_id" placeholder="Enter ticket ID">
         <label>Or Search Query:</label>
