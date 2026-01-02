@@ -1,155 +1,165 @@
 import os
+import sys
 import base64
 import httpx
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+from duckduckgo_search import DDGS
+from dotenv import load_dotenv
 
-# -------------------------------------------------
-# ENV
-# -------------------------------------------------
-ZENDESK_EMAIL = os.getenv("ZENDESK_EMAIL")
-ZENDESK_API_TOKEN = os.getenv("ZENDESK_API_TOKEN")
-ZENDESK_SUBDOMAIN = os.getenv("ZENDESK_SUBDOMAIN")
-API_KEY = os.getenv("API_KEY")
+# ------------------ ENV SETUP ------------------
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+# Uncomment for local testing
+# load_dotenv(os.path.join(BASE_DIR, ".env"))
 
-IS_PROD = os.getenv("RAILWAY_ENVIRONMENT") == "production"
+ZENDESK_SUBDOMAIN = os.getenv("ZENDESK_SUBDOMAIN", "castsoftware")
 
-# -------------------------------------------------
-# FASTAPI
-# -------------------------------------------------
-app = FastAPI(title="MCP Zendesk Server")
+# ----------------- APP DEFINITION -----------------
+app = FastAPI(title="MCP Web API")
 
+# -------- CORS (required for internal tooling) --------
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# -------------------------------------------------
-# SECURITY MIDDLEWARE
-# -------------------------------------------------
-@app.middleware("http")
-async def api_key_guard(request: Request, call_next):
-    if request.url.path.startswith("/debug") or request.url.path == "/version":
-        return await call_next(request)
+# -------- STARTUP LOGGING --------
+@app.on_event("startup")
+async def startup_event():
+    email_loaded = bool(os.getenv("ZENDESK_EMAIL"))
+    token_loaded = bool(os.getenv("ZENDESK_API_TOKEN"))
+    subdomain = ZENDESK_SUBDOMAIN
 
-    if not API_KEY:
-        raise HTTPException(status_code=500, detail="API_KEY not configured")
+    token_display = "****" + os.getenv("ZENDESK_API_TOKEN", "")[-4:] if token_loaded else None
+    email_display = os.getenv("ZENDESK_EMAIL", "None") if email_loaded else "None"
 
-    api_key = request.headers.get("x-api-key")
-    if api_key != API_KEY:
-        raise HTTPException(status_code=401, detail="Unauthorized")
+    print(f"[STARTUP] Zendesk Email Loaded: {email_loaded} ({email_display})", file=sys.stderr)
+    print(f"[STARTUP] Zendesk API Token Loaded: {token_loaded} ({token_display})", file=sys.stderr)
+    print(f"[STARTUP] Zendesk Subdomain: {subdomain}", file=sys.stderr)
 
-    return await call_next(request)
-
-# -------------------------------------------------
-# HELPERS
-# -------------------------------------------------
+# -------- Helper: Zendesk Auth Header ----------
 def zendesk_headers():
-    if not all([ZENDESK_EMAIL, ZENDESK_API_TOKEN]):
-        raise HTTPException(status_code=500, detail="Zendesk credentials missing")
+    """Reads Zendesk credentials from environment at request time"""
+    email = os.getenv("ZENDESK_EMAIL")
+    token = os.getenv("ZENDESK_API_TOKEN")
 
-    auth = f"{ZENDESK_EMAIL}/token:{ZENDESK_API_TOKEN}"
-    encoded = base64.b64encode(auth.encode()).decode()
+    if not email or not token:
+        raise HTTPException(status_code=500, detail="Zendesk credentials not set in environment")
+
+    auth_str = f"{email}/token:{token}"
+    encoded = base64.b64encode(auth_str.encode()).decode()
 
     return {
         "Authorization": f"Basic {encoded}",
-        "Content-Type": "application/json"
+        "Content-Type": "application/json",
+        "User-Agent": "MCP-Web"
     }
 
-def summarize_ticket(ticket, comments):
-    lines = [
-        f"TICKET #{ticket['id']}: {ticket['subject']}",
-        f"STATUS: {ticket['status']}",
-        f"CREATED: {ticket['created_at']}",
-        "",
-        "RECENT ACTIVITY:"
-    ]
+# -------- Request Models --------
+class QueryRequest(BaseModel):
+    query: str
 
-    for c in comments[-3:]:
-        body = c.get("plain_body", "").strip()
-        if body:
-            lines.append(f"- {body[:300]}")
-
-    return "\n".join(lines)
-
-def render_ticket_html(ticket, comments):
-    history = "".join(
-        f"""
-        <li>
-            <b>User {c['author_id']}:</b><br/>
-            <pre>{c.get('plain_body','')}</pre>
-        </li>
-        """
-        for c in comments
-    )
-
-    return f"""
-    <h2>Ticket #{ticket['id']}</h2>
-    <p><b>Status:</b> {ticket['status']}</p>
-    <p><b>Priority:</b> {ticket.get('priority')}</p>
-    <p><b>Subject:</b> {ticket['subject']}</p>
-
-    <h3>Description</h3>
-    <pre>{ticket['description']}</pre>
-
-    <h3>Conversation</h3>
-    <ul>{history}</ul>
-    """
-
-# -------------------------------------------------
-# MODELS
-# -------------------------------------------------
 class TicketRequest(BaseModel):
     ticket_id: int
 
-# -------------------------------------------------
-# ROUTES
-# -------------------------------------------------
-@app.get("/version")
-def version():
+# -------- ROUTES --------
+@app.get("/debug/env")
+def debug_env():
+    """Check if variables are loaded at startup"""
     return {
-        "service": "mcp-server-web",
-        "commit": os.getenv("RAILWAY_GIT_COMMIT_SHA"),
-        "deployment": os.getenv("RAILWAY_DEPLOYMENT_ID"),
-        "environment": os.getenv("RAILWAY_ENVIRONMENT"),
+        "email": bool(os.getenv("ZENDESK_EMAIL")),
+        "token": bool(os.getenv("ZENDESK_API_TOKEN")),
+        "subdomain": ZENDESK_SUBDOMAIN,
     }
+
+@app.get("/debug/zendesk")
+def debug_zendesk():
+    """Check live environment variables"""
+    return {
+        "email": os.getenv("ZENDESK_EMAIL"),
+        "token": os.getenv("ZENDESK_API_TOKEN"),
+        "subdomain": ZENDESK_SUBDOMAIN
+    }
+
+@app.post("/search/docs")
+async def search_docs(req: QueryRequest):
+    """Search CAST documentation"""
+    try:
+        with DDGS() as ddgs:
+            results = ddgs.text(f"site:doc.castsoftware.com {req.query}", max_results=5)
+            if not results:
+                return {"result": "No documentation found."}
+
+            output = [
+                f"Title: {r['title']}\nLink: {r['href']}\nSnippet: {r['body']}\n----------------------"
+                for r in results
+            ]
+            return {"result": "\n".join(output)}
+
+    except Exception as e:
+        return {"result": f"Error: {e}"}
+
+@app.post("/search/tickets")
+async def search_tickets(req: QueryRequest):
+    """Search Zendesk tickets"""
+    headers = zendesk_headers()
+    url = f"https://{ZENDESK_SUBDOMAIN}.zendesk.com/api/v2/search.json"
+
+    async with httpx.AsyncClient() as client:
+        resp = await client.get(url, params={"query": f"type:ticket {req.query}"}, headers=headers)
+
+        if resp.status_code == 401:
+            return {"result": "Zendesk authentication failed."}
+
+        results = resp.json().get("results", [])
+        if not results:
+            return {"result": "No tickets found."}
+
+        lines = [f"ID: {t['id']} | {t['subject']}" for t in results[:5]]
+        return {"result": "\n".join(lines)}
 
 @app.post("/ticket/details")
 async def ticket_details(req: TicketRequest):
-    ticket_url = f"https://{ZENDESK_SUBDOMAIN}.zendesk.com/api/v2/tickets/{req.ticket_id}.json"
-    comments_url = f"https://{ZENDESK_SUBDOMAIN}.zendesk.com/api/v2/tickets/{req.ticket_id}/comments.json"
+    """Get full ticket details"""
+    headers = zendesk_headers()
 
-    async with httpx.AsyncClient(timeout=30) as client:
-        ticket_res = await client.get(ticket_url, headers=zendesk_headers())
-        comments_res = await client.get(comments_url, headers=zendesk_headers())
+    async with httpx.AsyncClient() as client:
+        t_resp = await client.get(
+            f"https://{ZENDESK_SUBDOMAIN}.zendesk.com/api/v2/tickets/{req.ticket_id}.json",
+            headers=headers,
+        )
 
-    if ticket_res.status_code != 200:
-        raise HTTPException(status_code=404, detail="Ticket not found")
+        if t_resp.status_code == 401:
+            return {"result": "Zendesk authentication failed."}
+        if t_resp.status_code == 404:
+            return {"result": "Ticket not found."}
 
-    ticket = ticket_res.json()["ticket"]
-    comments = comments_res.json()["comments"]
+        ticket = t_resp.json()["ticket"]
 
-    return {
-        "summary": summarize_ticket(ticket, comments),
-        "html": render_ticket_html(ticket, comments),
-        "raw": {
-            "ticket": ticket,
-            "comments": comments
-        }
-    }
+        c_resp = await client.get(
+            f"https://{ZENDESK_SUBDOMAIN}.zendesk.com/api/v2/tickets/{req.ticket_id}/comments.json",
+            headers=headers,
+        )
 
-# -------------------------------------------------
-# DEBUG (NON-PROD ONLY)
-# -------------------------------------------------
-if not IS_PROD:
-    @app.get("/debug/zendesk")
-    def debug_zendesk():
-        return {
-            "email": bool(ZENDESK_EMAIL),
-            "token": bool(ZENDESK_API_TOKEN),
-            "subdomain": ZENDESK_SUBDOMAIN
-        }
+        comments = c_resp.json().get("comments", [])
+
+        history = "\n\n".join(
+            f"User {c['author_id']}:\n{c.get('plain_body','')}" for c in comments
+        )
+
+        output = (
+            f"TICKET #{ticket['id']}\n"
+            f"SUBJECT: {ticket['subject']}\n"
+            f"STATUS: {ticket['status']}\n\n"
+            f"DESCRIPTION:\n{ticket['description']}\n\n"
+            f"HISTORY:\n{history}"
+        )
+
+        return {"result": output}
+
+@app.get("/")
+def health():
+    return {"status": "ok"}
