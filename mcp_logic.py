@@ -1,97 +1,61 @@
 import os
 import sys
 import httpx
-from duckduckgo_search import DDGS
+from fastapi import FastAPI
 from dotenv import load_dotenv
 
-# --- ENV LOADING ---
-current_dir = os.path.dirname(os.path.abspath(__file__))
-env_file_path = os.path.join(current_dir, '.env')
-load_dotenv(env_file_path)
+load_dotenv()
 
-ZENDESK_COOKIE = os.getenv("ZENDESK_COOKIE")
+app = FastAPI()
+
 ZENDESK_SUBDOMAIN = "castsoftware"
+ZENDESK_EMAIL = os.getenv("ZENDESK_EMAIL")
+ZENDESK_API_TOKEN = os.getenv("ZENDESK_API_TOKEN")
 
-print(f"Loading config from: {env_file_path}", file=sys.stderr)
-print("✅ Cookie loaded" if ZENDESK_COOKIE else "❌ Cookie missing", file=sys.stderr)
+if ZENDESK_EMAIL and ZENDESK_API_TOKEN:
+    print("✅ Zendesk API credentials loaded", file=sys.stderr)
+else:
+    print("❌ Missing Zendesk API credentials", file=sys.stderr)
 
-# ---------------- MCP LOGIC ---------------- #
+def zendesk_auth():
+    return (f"{ZENDESK_EMAIL}/token", ZENDESK_API_TOKEN)
 
-async def search_cast_documentation(query: str) -> str:
-    try:
-        with DDGS() as ddgs:
-            results = ddgs.text(
-                f"site:doc.castsoftware.com {query}",
-                max_results=5
-            )
-            if not results:
-                return "No documentation found."
+@app.post("/ticket/details")
+async def get_ticket_details(payload: dict):
+    ticket_id = payload.get("ticket_id")
+    if not ticket_id:
+        return {"error": "ticket_id required"}
 
-            return "\n".join(
-                f"Title: {r['title']}\nLink: {r['href']}\nSnippet: {r['body']}\n---"
-                for r in results
-            )
-    except Exception as e:
-        return f"Search Error: {e}"
+    if not ZENDESK_EMAIL or not ZENDESK_API_TOKEN:
+        return {"error": "Zendesk API credentials not configured"}
 
+    async with httpx.AsyncClient(auth=zendesk_auth()) as client:
+        ticket_url = f"https://{ZENDESK_SUBDOMAIN}.zendesk.com/api/v2/tickets/{ticket_id}.json"
+        comments_url = f"https://{ZENDESK_SUBDOMAIN}.zendesk.com/api/v2/tickets/{ticket_id}/comments.json"
 
-async def search_zendesk_tickets(query: str) -> str:
-    if not ZENDESK_COOKIE:
-        return "Error: Zendesk cookie missing."
-
-    url = f"https://{ZENDESK_SUBDOMAIN}.zendesk.com/api/v2/search.json"
-    headers = {"Cookie": ZENDESK_COOKIE, "User-Agent": "MCP-Bot"}
-
-    async with httpx.AsyncClient() as client:
-        resp = await client.get(
-            url,
-            params={"query": f"type:ticket {query}"},
-            headers=headers
-        )
-
-        if resp.status_code == 401:
-            return "Error: Cookie expired."
-
-        results = resp.json().get("results", [])
-        return (
-            "\n".join(f"ID: {t['id']} | {t['subject']}" for t in results[:5])
-            if results else "No tickets found."
-        )
-
-
-async def get_ticket_details(ticket_id: int) -> str:
-    if not ZENDESK_COOKIE:
-        return "Error: Zendesk cookie missing."
-
-    headers = {"Cookie": ZENDESK_COOKIE, "User-Agent": "MCP-Bot"}
-
-    async with httpx.AsyncClient() as client:
-        t_resp = await client.get(
-            f"https://{ZENDESK_SUBDOMAIN}.zendesk.com/api/v2/tickets/{ticket_id}.json",
-            headers=headers
-        )
-
-        if t_resp.status_code == 401:
-            return "Error: Cookie expired."
+        t_resp = await client.get(ticket_url)
         if t_resp.status_code == 404:
-            return "Ticket not found."
+            return {"error": "Ticket not found"}
+        if t_resp.status_code == 401:
+            return {"error": "Zendesk authentication failed"}
 
-        ticket = t_resp.json().get("ticket", {})
+        ticket = t_resp.json()["ticket"]
 
-        c_resp = await client.get(
-            f"https://{ZENDESK_SUBDOMAIN}.zendesk.com/api/v2/tickets/{ticket_id}/comments.json",
-            headers=headers
-        )
+        c_resp = await client.get(comments_url)
+        comments = c_resp.json()["comments"]
 
-        comments = c_resp.json().get("comments", [])
-        conversation = [
-            f"User {c['author_id']}: {c.get('plain_body', '')}"
+        history = [
+            {
+                "author_id": c["author_id"],
+                "comment": c.get("plain_body", "")
+            }
             for c in comments
         ]
 
-        return (
-            f"TICKET #{ticket['id']}: {ticket['subject']}\n"
-            f"STATUS: {ticket['status']}\n"
-            f"DESC: {ticket['description']}\n\n"
-            "HISTORY:\n" + "\n---\n".join(conversation)
-        )
+        return {
+            "id": ticket["id"],
+            "subject": ticket["subject"],
+            "status": ticket["status"],
+            "description": ticket["description"],
+            "history": history
+        }
