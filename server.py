@@ -89,29 +89,7 @@ def highlight_keywords(text, keywords):
             text = pattern.sub(lambda m: f"<mark>{m.group(0)}</mark>", text)
     return text
 
-# -------- Helper: Fetch Documentation with Caching ----------
-DOC_CACHE = {}  # ✅ Cache doc results
-
-def fetch_docs(query):
-    if query in DOC_CACHE:
-        return DOC_CACHE[query]
-
-    docs = []
-    try:
-        with DDGS() as ddgs:
-            results = ddgs.text(f"site:doc.castsoftware.com {query}", max_results=5)  # ✅ DuckDuckGo search
-            for r in results:
-                title = r.get("title") or r.get("body") or "Documentation"
-                url = r.get("href") or ""
-                if url:
-                    docs.append({"title": title, "url": url})
-    except Exception:
-        pass
-
-    DOC_CACHE[query] = docs
-    return docs
-
-# -------- Shared Helper: Build Summary ----------
+# -------- Shared Helper: Build Summary --------
 async def generate_summary(query=None, ticket_ids=None):
     related_tickets = []
     related_docs = []
@@ -165,14 +143,20 @@ async def generate_summary(query=None, ticket_ids=None):
 
         # -------- Fetch Related Docs --------
         if query:
-            related_docs = fetch_docs(query)  # ✅ DuckDuckGo docs + cache
+            try:
+                with DDGS() as ddgs:
+                    docs = ddgs.text(f"site:doc.castsoftware.com {query}", max_results=3)
+                    for d in docs:
+                        related_docs.append({"title": d["title"], "url": d["href"]})
+            except Exception:
+                pass
 
         # -------- Generate Recommended Solution --------
         if related_tickets or related_docs:
             recommended_solution = (
                 "Based on similar tickets and documentation, "
                 "apply recommended updates, known workarounds, "
-                "or adjust configuration as per CAST guidelines."  # ✅ Dynamic solution
+                "or adjust configuration as per CAST guidelines."
             )
         else:
             recommended_solution = (
@@ -222,8 +206,102 @@ async def search_all(req: QueryRequest):
 # -------- Web UI --------
 @app.get("/", response_class=HTMLResponse)
 def home():
-    return """  <!-- UI unchanged --> ... """  # Your existing HTML/UI code remains fully intact
+    return """
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>MCP Support Dashboard</title>
+        <style>
+            body { font-family: Arial, sans-serif; background: #f4f4f4; padding: 20px; max-width: 1000px; margin: auto; }
+            h1 { text-align: center; }
+            input, button { padding: 10px; margin: 5px 0; width: 100%; max-width: 400px; border-radius: 5px; border: 1px solid #ccc; }
+            button { cursor: pointer; background: #007bff; color: #fff; border: none; }
+            button:hover { background: #0056b3; }
+            .result { margin-top: 20px; }
+            .card { background: #fff; border-radius: 8px; padding: 15px; margin-bottom: 15px; box-shadow: 0 2px 5px rgba(0,0,0,0.1); }
+            .card a { text-decoration: none; color: #007bff; }
+            .section-title { font-weight: bold; margin-bottom: 10px; }
+            pre { white-space: pre-wrap; word-wrap: break-word; }
+            mark { background-color: #ffff00; font-weight: bold; }
+        </style>
+    </head>
+    <body>
+        <h1>CAST Support Dashboard</h1>
 
-@app.get("/health")
-def health():
-    return {"status": "ok"}
+        <label>Ticket ID (optional):</label>
+        <input type="number" id="ticket_id" placeholder="Enter ticket ID">
+        <label>Or Search Query:</label>
+        <input type="text" id="query" placeholder="Enter keywords to search">
+        <button onclick="submitQuery()">Submit</button>
+
+        <div class="result" id="result"></div>
+
+        <script>
+            async function submitQuery() {
+                const ticketId = document.getElementById('ticket_id').value;
+                const query = document.getElementById('query').value;
+                const resultDiv = document.getElementById('result');
+                resultDiv.innerHTML = "<p>Loading...</p>";
+
+                let url, body;
+                if (ticketId) {
+                    url = '/ticket/details';
+                    body = JSON.stringify({ ticket_id: parseInt(ticketId) });
+                } else if (query) {
+                    url = '/search/all';
+                    body = JSON.stringify({ query: query });
+                } else {
+                    resultDiv.innerHTML = "<p>Please enter ticket ID or search query!</p>";
+                    return;
+                }
+
+                try {
+                    const response = await fetch(url, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: body
+                    });
+                    if (!response.ok) {
+                        resultDiv.innerHTML = "<p>Error: " + response.statusText + "</p>";
+                        return;
+                    }
+                    const data = await response.json();
+
+                    let html = `<div class="card"><div class="section-title">Summary</div><pre>${data.summary}</pre></div>`;
+
+                    // Confidence color-coded
+                    let confidenceColor = data.confidence > 0.7 ? "green" : data.confidence > 0.5 ? "orange" : "red";
+                    html += `<div class="card"><div class="section-title">Confidence</div><pre style="color:${confidenceColor}">${data.confidence}</pre></div>`;
+
+                    html += `<div class="card"><div class="section-title">Related Tickets</div>`;
+                    if (data.related_tickets.length > 0) {
+                        data.related_tickets.forEach(t => {
+                            const title = t.subject || "Ticket " + t.id;
+                            html += `<p><a href="${t.url}" target="_blank">${title}</a></p>`;
+                        });
+                    } else {
+                        html += "<p>No related tickets found.</p>";
+                    }
+                    html += "</div>";
+
+                    html += `<div class="card"><div class="section-title">Related Documentation</div>`;
+                    if (data.related_docs.length > 0) {
+                        data.related_docs.forEach(d => {
+                            html += `<p><a href="${d.url}" target="_blank">${d.title}</a></p>`;
+                        });
+                    } else {
+                        html += "<p>No related documentation found.</p>";
+                    }
+                    html += "</div>";
+
+                    html += `<div class="card"><div class="section-title">Recommended Solution</div><pre>${data.recommended_solution}</pre></div>`;
+
+                    resultDiv.innerHTML = html;
+                } catch (err) {
+                    resultDiv.innerHTML = "<p>Error: " + err + "</p>";
+                }
+            }
+        </script>
+    </body>
+    </html>
+    """
