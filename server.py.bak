@@ -13,15 +13,17 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 # Uncomment for local testing
 # load_dotenv(os.path.join(BASE_DIR, ".env"))
 
+ZENDESK_EMAIL = os.getenv("ZENDESK_EMAIL")
+ZENDESK_API_TOKEN = os.getenv("ZENDESK_API_TOKEN")
 ZENDESK_SUBDOMAIN = os.getenv("ZENDESK_SUBDOMAIN", "castsoftware")
 
 # ----------------- APP DEFINITION -----------------
 app = FastAPI(title="MCP Web API")
 
-# -------- CORS (required for internal tooling) --------
+# -------- CORS (required for Vercel UI) --------
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["*"],   # OK for internal tooling
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -29,12 +31,12 @@ app.add_middleware(
 # -------- STARTUP LOGGING --------
 @app.on_event("startup")
 async def startup_event():
-    email_loaded = bool(os.getenv("ZENDESK_EMAIL"))
-    token_loaded = bool(os.getenv("ZENDESK_API_TOKEN"))
+    email_loaded = bool(ZENDESK_EMAIL)
+    token_loaded = bool(ZENDESK_API_TOKEN)
     subdomain = ZENDESK_SUBDOMAIN
 
-    token_display = "****" + os.getenv("ZENDESK_API_TOKEN", "")[-4:] if token_loaded else None
-    email_display = os.getenv("ZENDESK_EMAIL", "None") if email_loaded else "None"
+    token_display = "****" + ZENDESK_API_TOKEN[-4:] if token_loaded else None
+    email_display = ZENDESK_EMAIL if email_loaded else "None"
 
     print(f"[STARTUP] Zendesk Email Loaded: {email_loaded} ({email_display})", file=sys.stderr)
     print(f"[STARTUP] Zendesk API Token Loaded: {token_loaded} ({token_display})", file=sys.stderr)
@@ -43,15 +45,11 @@ async def startup_event():
 
 # -------- Helper: Zendesk Auth Header ----------
 def zendesk_headers():
-    """Reads Zendesk credentials from environment at request time"""
-    email = os.getenv("ZENDESK_EMAIL")
-    token = os.getenv("ZENDESK_API_TOKEN")
-
-    if not email or not token:
+    if not ZENDESK_EMAIL or not ZENDESK_API_TOKEN:
         raise HTTPException(status_code=500, detail="Zendesk credentials not set in environment")
 
-    auth_str = f"{email}/token:{token}"
-    encoded = base64.b64encode(auth_str.encode()).decode()
+    token = f"{ZENDESK_EMAIL}/token:{ZENDESK_API_TOKEN}"
+    encoded = base64.b64encode(token.encode()).decode()
 
     return {
         "Authorization": f"Basic {encoded}",
@@ -70,8 +68,8 @@ class TicketRequest(BaseModel):
 @app.get("/debug/env")
 def debug_env():
     return {
-        "email": bool(os.getenv("ZENDESK_EMAIL")),
-        "token": bool(os.getenv("ZENDESK_API_TOKEN")),
+        "email": bool(ZENDESK_EMAIL),
+        "token": bool(ZENDESK_API_TOKEN),
         "subdomain": ZENDESK_SUBDOMAIN,
     }
 
@@ -81,6 +79,7 @@ async def search_docs(req: QueryRequest):
     try:
         with DDGS() as ddgs:
             results = ddgs.text(f"site:doc.castsoftware.com {req.query}", max_results=5)
+
             if not results:
                 return {"result": "No documentation found."}
 
@@ -129,7 +128,6 @@ async def ticket_details(req: TicketRequest):
             return {"result": "Ticket not found."}
 
         ticket = t_resp.json()["ticket"]
-
         c_resp = await client.get(
             f"https://{ZENDESK_SUBDOMAIN}.zendesk.com/api/v2/tickets/{req.ticket_id}/comments.json",
             headers=headers,
