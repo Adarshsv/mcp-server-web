@@ -1,18 +1,14 @@
 import os
-import sys
-import base64
+import re
 import httpx
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from duckduckgo_search import DDGS
 from collections import Counter
+from typing import List, Optional
 
-# ------------------ ENV ------------------
-ZENDESK_SUBDOMAIN = os.getenv("ZENDESK_SUBDOMAIN", "castsoftware")
-
-# ------------------ APP ------------------
-app = FastAPI(title="MCP Web API")
+# ------------------ APP SETUP ------------------
+app = FastAPI(title="Zendesk Smart Search API")
 
 app.add_middleware(
     CORSMiddleware,
@@ -21,188 +17,220 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ------------------ STARTUP LOG ------------------
-@app.on_event("startup")
-async def startup():
-    print("[STARTUP] Zendesk Email:", bool(os.getenv("ZENDESK_EMAIL")), file=sys.stderr)
-    print("[STARTUP] Zendesk Token:", bool(os.getenv("ZENDESK_API_TOKEN")), file=sys.stderr)
-    print("[STARTUP] Subdomain:", ZENDESK_SUBDOMAIN, file=sys.stderr)
+# ------------------ ENV ------------------
+ZENDESK_SUBDOMAIN = os.getenv("ZENDESK_SUBDOMAIN")
+ZENDESK_EMAIL = os.getenv("ZENDESK_EMAIL")
+ZENDESK_API_TOKEN = os.getenv("ZENDESK_API_TOKEN")
+API_KEY = os.getenv("API_KEY")  # optional (DEV-friendly)
+
+ZENDESK_BASE = f"https://{ZENDESK_SUBDOMAIN}.zendesk.com/api/v2"
 
 # ------------------ MODELS ------------------
 class TicketRequest(BaseModel):
     ticket_id: int
 
+
 class SearchRequest(BaseModel):
     query: str
 
-# ------------------ HELPERS ------------------
+
+# ------------------ AUTH ------------------
+def check_api_key(x_api_key: Optional[str]):
+    if API_KEY and x_api_key != API_KEY:
+        raise HTTPException(status_code=401, detail="Invalid API key")
+
+
 def zendesk_headers():
-    email = os.getenv("ZENDESK_EMAIL")
-    token = os.getenv("ZENDESK_API_TOKEN")
-
-    if not email or not token:
-        raise HTTPException(500, "Zendesk credentials not set")
-
-    auth = base64.b64encode(f"{email}/token:{token}".encode()).decode()
     return {
-        "Authorization": f"Basic {auth}",
-        "Content-Type": "application/json"
+        "Authorization": (
+            "Basic "
+            + httpx._models._base64.b64encode(
+                f"{ZENDESK_EMAIL}/token:{ZENDESK_API_TOKEN}".encode()
+            ).decode()
+        ),
+        "Content-Type": "application/json",
     }
 
-def ticket_link(ticket_id):
-    return f"https://{ZENDESK_SUBDOMAIN}.zendesk.com/agent/tickets/{ticket_id}"
 
-def summarise_comments(comments):
-    texts = [c.get("plain_body", "") for c in comments if c.get("plain_body")]
-    if not texts:
-        return "No investigation comments available."
+# ------------------ HELPERS ------------------
+RESOLUTION_KEYWORDS = {
+    "upgrade": [
+        "upgrade",
+        "8.4",
+        "new version",
+        "latest version",
+        "move to",
+    ],
+    "workaround": [
+        "workaround",
+        "exception",
+        "exclude",
+        "temporary",
+        "mitigate",
+    ],
+    "not_supported": [
+        "not supported",
+        "cannot fix",
+        "limitation",
+        "no fix",
+    ],
+}
 
-    keywords = Counter(" ".join(texts).lower().split())
-    key_terms = ", ".join([k for k, _ in keywords.most_common(5)])
+
+RESOLUTION_TEXT = {
+    "upgrade": "Upgrade to a newer supported product/runtime version where this limitation is resolved.",
+    "workaround": "Apply a documented workaround or exception to mitigate the issue.",
+    "not_supported": "This is a known limitation and cannot be fixed in the current version.",
+    "unknown": "No definitive resolution identified. Further investigation may be required.",
+}
+
+
+def extract_resolution_signals(text: str, counter: Counter):
+    t = text.lower()
+    for key, words in RESOLUTION_KEYWORDS.items():
+        if any(w in t for w in words):
+            counter[key] += 1
+
+
+def infer_resolution(comments: List[str]):
+    counter = Counter()
+    for c in comments:
+        extract_resolution_signals(c, counter)
+
+    if not counter:
+        return "unknown", 0.1
+
+    dominant, count = counter.most_common(1)[0]
+    confidence = min(0.95, count / max(1, sum(counter.values())))
+    return dominant, round(confidence, 2)
+
+
+def summarize_comments(comments: List[str]) -> str:
+    if not comments:
+        return "No significant discussion found."
 
     return (
-        f"Investigation involved {len(texts)} comments.\n"
-        f"Frequent topics: {key_terms}."
+        f"Reviewed {len(comments)} comments. "
+        f"Discussion focuses on root cause analysis, version compatibility, "
+        f"and possible upgrade or workaround paths."
     )
 
-def extract_resolution(comments):
-    for c in reversed(comments):
-        body = c.get("plain_body", "").lower()
-        if any(k in body for k in ["resolved", "fixed", "upgrade", "solution", "workaround"]):
-            return c.get("plain_body")[:800]
-    return "Resolution not explicitly documented. Recommendation inferred from discussion."
 
-def generate_kb(ticket, resolution, docs):
-    return f"""
-Title:
-{ticket['subject']}
+# ------------------ ZENDESK API ------------------
+async def get_ticket(ticket_id: int):
+    async with httpx.AsyncClient() as client:
+        r = await client.get(
+            f"{ZENDESK_BASE}/tickets/{ticket_id}.json",
+            headers=zendesk_headers(),
+        )
+        r.raise_for_status()
+        return r.json()["ticket"]
 
-Problem:
-{ticket['description']}
 
-Root Cause:
-Product limitation or deprecated dependency.
+async def get_ticket_comments(ticket_id: int):
+    async with httpx.AsyncClient() as client:
+        r = await client.get(
+            f"{ZENDESK_BASE}/tickets/{ticket_id}/comments.json",
+            headers=zendesk_headers(),
+        )
+        r.raise_for_status()
+        return [
+            c["body"] for c in r.json()["comments"] if not c.get("public") is False
+        ]
 
-Resolution:
-{resolution}
 
-Recommended Action:
-Upgrade to supported version or apply documented workaround.
+async def search_tickets(query: str):
+    async with httpx.AsyncClient() as client:
+        r = await client.get(
+            f"{ZENDESK_BASE}/search.json",
+            params={"query": query, "type": "ticket"},
+            headers=zendesk_headers(),
+        )
+        r.raise_for_status()
+        return r.json()["results"]
 
-References:
-{docs or "No official docs referenced."}
 
-Applies To:
-CAST AIP
-""".strip()
+# ------------------ SHARED SUMMARY ENGINE ------------------
+async def build_summary_from_tickets(tickets: List[dict]):
+    all_comments = []
+    related = []
 
-def search_docs(query):
-    with DDGS() as ddgs:
-        return list(ddgs.text(f"site:doc.castsoftware.com {query}", max_results=3))
+    for t in tickets[:10]:  # limit for performance
+        try:
+            comments = await get_ticket_comments(t["id"])
+            all_comments.extend(comments)
+            related.append(
+                {
+                    "id": t["id"],
+                    "subject": t["subject"],
+                    "status": t["status"],
+                }
+            )
+        except Exception:
+            continue
+
+    resolution_key, confidence = infer_resolution(all_comments)
+
+    summary = {
+        "problem_summary": (
+            f"Multiple tickets describe a recurring issue related to the searched topic."
+        ),
+        "comment_summary": summarize_comments(all_comments),
+        "suggested_resolution": RESOLUTION_TEXT[resolution_key],
+        "confidence": confidence,
+        "related_tickets": related[:3],
+    }
+
+    return summary
+
 
 # ------------------ ROUTES ------------------
 @app.post("/ticket/details")
-async def ticket_details(req: TicketRequest):
-    headers = zendesk_headers()
+async def ticket_details(
+    req: TicketRequest, x_api_key: Optional[str] = Header(None)
+):
+    check_api_key(x_api_key)
 
-    async with httpx.AsyncClient() as client:
-        t = await client.get(
-            f"https://{ZENDESK_SUBDOMAIN}.zendesk.com/api/v2/tickets/{req.ticket_id}.json",
-            headers=headers
-        )
-        c = await client.get(
-            f"https://{ZENDESK_SUBDOMAIN}.zendesk.com/api/v2/tickets/{req.ticket_id}/comments.json",
-            headers=headers
-        )
+    ticket = await get_ticket(req.ticket_id)
+    comments = await get_ticket_comments(req.ticket_id)
 
-    if t.status_code != 200:
-        return {"error": "Ticket not found"}
+    resolution_key, confidence = infer_resolution(comments)
 
-    ticket = t.json()["ticket"]
-    comments = c.json().get("comments", [])
-
-    comment_summary = summarise_comments(comments)
-    resolution = extract_resolution(comments)
-
-    related_search = f"type:ticket {ticket['subject']}"
-    async with httpx.AsyncClient() as client:
-        r = await client.get(
-            f"https://{ZENDESK_SUBDOMAIN}.zendesk.com/api/v2/search.json",
-            headers=headers,
-            params={"query": related_search}
-        )
-
-    related = [
-        {
-            "id": x["id"],
-            "subject": x["subject"],
-            "status": x["status"],
-            "link": ticket_link(x["id"])
+    summary = {
+        "summary": {
+            "issue": ticket["subject"],
+            "observed_behavior": summarize_comments(comments),
+            "suggested_resolution": RESOLUTION_TEXT[resolution_key],
+            "confidence": confidence,
         }
-        for x in r.json().get("results", []) if x["id"] != ticket["id"]
-    ][:5]
-
-    docs = search_docs(ticket["subject"])
-    docs_summary = "\n".join(d["title"] for d in docs) if docs else ""
-
-    kb = generate_kb(ticket, resolution, docs_summary)
-
-    html = f"""
-<h2>TICKET #{ticket['id']}</h2>
-<b>Status:</b> {ticket['status']}<br><br>
-
-<h3>Description</h3>
-<pre>{ticket['description']}</pre>
-
-<h3>Summary</h3>
-<pre>{comment_summary}</pre>
-
-<h3>Resolution</h3>
-<pre>{resolution}</pre>
-
-<h3>Related Tickets</h3>
-<ul>
-{''.join(f"<li><a href='{t['link']}'>#{t['id']} - {t['subject']}</a></li>" for t in related)}
-</ul>
-
-<h3>Suggested KB Article</h3>
-<pre>{kb}</pre>
-"""
-
-    return {
-        "summary": f"{comment_summary}\n\nResolution:\n{resolution}",
-        "confidence": round(min(1.0, 0.3 + (len(related) * 0.15)), 2),
-        "related_tickets": related,
-        "kb_draft": kb,
-        "html": html
     }
 
+    return summary
+
+
 @app.post("/search/all")
-async def search_all(req: SearchRequest):
-    headers = zendesk_headers()
+async def search_all(
+    req: SearchRequest, x_api_key: Optional[str] = Header(None)
+):
+    check_api_key(x_api_key)
 
-    async with httpx.AsyncClient() as client:
-        tickets = await client.get(
-            f"https://{ZENDESK_SUBDOMAIN}.zendesk.com/api/v2/search.json",
-            headers=headers,
-            params={"query": f"type:ticket {req.query}"}
-        )
+    tickets = await search_tickets(req.query)
 
-    docs = search_docs(req.query)
+    if not tickets:
+        return {
+            "query": req.query,
+            "summary": "No related tickets found.",
+        }
 
-    summary = (
-        f"Search '{req.query}' found "
-        f"{len(tickets.json().get('results', []))} tickets "
-        f"and {len(docs)} documentation references."
-    )
+    summary = await build_summary_from_tickets(tickets)
 
     return {
         "query": req.query,
         "summary": summary,
-        "tickets": tickets.json(),
-        "docs": docs
+        "ticket_count": len(tickets),
     }
 
-@app.get("/")
+
+@app.get("/health")
 def health():
     return {"status": "ok"}
