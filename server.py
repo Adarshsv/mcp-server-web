@@ -4,13 +4,9 @@ from fastapi import FastAPI
 from pydantic import BaseModel
 from typing import List, Dict
 
-# Optional OpenAI integration
-USE_OPENAI = True  # Set True to use OpenAI for summaries
+# ----------------- CONFIG -----------------
+USE_OPENAI = False  # Set True to use OpenAI for improved summaries
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-
-if USE_OPENAI:
-    import openai
-    openai.api_key = OPENAI_API_KEY
 
 app = FastAPI()
 
@@ -22,54 +18,35 @@ class SearchRequest(BaseModel):
     query: str
 
 # ----------------- HELPER FUNCTIONS -----------------
-def clean_text(text: str) -> str:
-    """Remove HTML, entities, and extra spaces."""
-    text = re.sub(r"<.*?>", " ", text)
-    text = re.sub(r"&[a-z]+;", " ", text)
-    text = re.sub(r"\s+", " ", text).strip()
-    return text
-
 def summarize_semantic(comments: List[Dict]) -> str:
     """
-    Summarize ticket/comments in 4-6 meaningful sentences.
-    Uses OpenAI if enabled; else uses simple extraction.
+    Summarize ticket/comments in 5-6 meaningful sentences.
     """
     if not comments:
         return "No ticket comments found."
     
-    text = " ".join([c.get("plain_body") or c.get("body", "") for c in comments[:10]])
-    text = clean_text(text)
-
-    if USE_OPENAI:
-        prompt = (
-            "Summarize the following technical ticket discussion in 4-5 concise, human-readable sentences. "
-            "Focus on the issue, cause, observed behavior, and suggested solution:\n\n" + text
-        )
-        try:
-            response = openai.Completion.create(
-                engine="text-davinci-003",
-                prompt=prompt,
-                temperature=0.5,
-                max_tokens=250,
-                top_p=1,
-                frequency_penalty=0,
-                presence_penalty=0
-            )
-            summary = response.choices[0].text.strip()
-            return summary
-        except Exception as e:
-            print("OpenAI error:", e)
-            # fallback to simple extraction
-            text = " ".join(text.split(".")[:5])
-            return text
-    else:
-        # fallback simple extraction (first 5 sentences containing keywords)
-        sentences = re.split(r'(?<=[.!?]) +', text)
-        keywords = ["error", "issue", "fail", "supported", "steps", "solution", "analysis"]
-        important = [s for s in sentences if any(k.lower() in s.lower() for k in keywords)]
-        if len(important) < 5:
-            important = sentences[:5]
-        return " ".join(important[:5])
+    # Combine first 5 comments
+    text = " ".join([c.get("plain_body") or c.get("body", "") for c in comments[:5]])
+    
+    # Remove HTML, extra spaces
+    text = re.sub(r"<.*?>", " ", text)
+    text = re.sub(r"&[a-z]+;", " ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    
+    # Split into sentences
+    sentences = re.split(r'(?<=[.!?]) +', text)
+    
+    # Pick sentences containing keywords
+    keywords = ["error", "issue", "fail", "supported", "steps", "solution", "analysis"]
+    important = [s for s in sentences if any(k.lower() in s.lower() for k in keywords)]
+    
+    # If not enough important sentences, take first few sentences
+    if len(important) < 5:
+        important = sentences[:5]
+    
+    # Limit to max 6 sentences
+    summary = " ".join(important[:6])
+    return summary
 
 def generate_summary(ticket_data: Dict) -> Dict:
     """
@@ -90,7 +67,7 @@ def generate_summary(ticket_data: Dict) -> Dict:
         for d in ticket_data.get("related_docs", [])
     ]
     
-    # Suggested solution
+    # Suggested solution (from AI or default fallback)
     recommended_solution = ticket_data.get("recommended_solution") or \
         "Based on similar tickets and documentation, apply recommended updates, workarounds, or adjust configuration as per CAST guidelines."
     
@@ -108,7 +85,10 @@ def ticket_details(request: TicketRequest):
     """
     Fetch ticket info and return concise semantic summary with links and solution.
     """
+    # Fetch ticket from DB/Service
+    # This is placeholder; replace with real data fetch
     ticket_data = fetch_ticket_data(request.ticket_id)
+    
     return generate_summary(ticket_data)
 
 @app.post("/search/all")
@@ -116,6 +96,7 @@ def search_all(request: SearchRequest):
     """
     Search tickets/docs by keyword and return concise summaries.
     """
+    # Fetch search results from DB/Service
     search_results = fetch_search_results(request.query)
     
     summarized_results = []
@@ -131,8 +112,9 @@ def search_all(request: SearchRequest):
 # ----------------- PLACEHOLDER FUNCTIONS -----------------
 def fetch_ticket_data(ticket_id: int) -> Dict:
     """
-    Replace with real ticket fetching logic.
+    Replace this with your real ticket fetching logic.
     """
+    # Example structure
     return {
         "comments": [
             {"plain_body": "The VC++ project fails because paths could not be substituted. Install correct Visual Studio IDE."},
@@ -151,7 +133,7 @@ def fetch_ticket_data(ticket_id: int) -> Dict:
 
 def fetch_search_results(query: str) -> Dict:
     """
-    Replace with real search logic.
+    Replace this with real search logic.
     """
     return {
         "tickets": [fetch_ticket_data(12345), fetch_ticket_data(12346)]
