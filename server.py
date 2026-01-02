@@ -10,24 +10,18 @@ from dotenv import load_dotenv
 
 # ------------------ ENV SETUP ------------------
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-#load_dotenv(os.path.join(BASE_DIR, ".env"))
+# Uncomment if using .env locally
+# load_dotenv(os.path.join(BASE_DIR, ".env"))
 
 ZENDESK_EMAIL = os.getenv("ZENDESK_EMAIL")
 ZENDESK_API_TOKEN = os.getenv("ZENDESK_API_TOKEN")
 ZENDESK_SUBDOMAIN = os.getenv("ZENDESK_SUBDOMAIN", "castsoftware")
 
-@app.get("/debug/env")
-def debug_env():
-    return {
-        "email": bool(ZENDESK_EMAIL),
-        "token": bool(ZENDESK_API_TOKEN),
-        "subdomain": ZENDESK_SUBDOMAIN,
-    }
-
 print("Zendesk email loaded:", bool(ZENDESK_EMAIL), file=sys.stderr)
 print("Zendesk API token loaded:", bool(ZENDESK_API_TOKEN), file=sys.stderr)
 # ----------------------------------------------
 
+# ----------------- APP DEFINITION -----------------
 app = FastAPI(title="MCP Web API")
 
 # -------- CORS (required for Vercel UI) --------
@@ -61,6 +55,15 @@ class QueryRequest(BaseModel):
 class TicketRequest(BaseModel):
     ticket_id: int
 # --------------------------------
+
+# -------- ROUTES --------
+@app.get("/debug/env")
+def debug_env():
+    return {
+        "email": bool(ZENDESK_EMAIL),
+        "token": bool(ZENDESK_API_TOKEN),
+        "subdomain": ZENDESK_SUBDOMAIN,
+    }
 
 
 @app.post("/search/docs")
