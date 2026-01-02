@@ -40,7 +40,6 @@ async def startup_event():
     print(f"[STARTUP] Zendesk API Token Loaded: {token_loaded} ({token_display})", file=sys.stderr)
     print(f"[STARTUP] Zendesk Subdomain: {subdomain}", file=sys.stderr)
 
-
 # -------- Helper: Zendesk Auth Header ----------
 def zendesk_headers():
     """Reads Zendesk credentials from environment at request time"""
@@ -69,10 +68,20 @@ class TicketRequest(BaseModel):
 # -------- ROUTES --------
 @app.get("/debug/env")
 def debug_env():
+    """Check if variables are loaded at startup"""
     return {
         "email": bool(os.getenv("ZENDESK_EMAIL")),
         "token": bool(os.getenv("ZENDESK_API_TOKEN")),
         "subdomain": ZENDESK_SUBDOMAIN,
+    }
+
+@app.get("/debug/zendesk")
+def debug_zendesk():
+    """Check live environment variables"""
+    return {
+        "email": os.getenv("ZENDESK_EMAIL"),
+        "token": os.getenv("ZENDESK_API_TOKEN"),
+        "subdomain": ZENDESK_SUBDOMAIN
     }
 
 @app.post("/search/docs")
