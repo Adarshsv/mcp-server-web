@@ -2,7 +2,7 @@ import os
 import sys
 import base64
 import httpx
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from duckduckgo_search import DDGS
@@ -10,16 +10,12 @@ from dotenv import load_dotenv
 
 # ------------------ ENV SETUP ------------------
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-# Uncomment if using .env locally
+# Uncomment for local testing
 # load_dotenv(os.path.join(BASE_DIR, ".env"))
 
 ZENDESK_EMAIL = os.getenv("ZENDESK_EMAIL")
 ZENDESK_API_TOKEN = os.getenv("ZENDESK_API_TOKEN")
 ZENDESK_SUBDOMAIN = os.getenv("ZENDESK_SUBDOMAIN", "castsoftware")
-
-print("Zendesk email loaded:", bool(ZENDESK_EMAIL), file=sys.stderr)
-print("Zendesk API token loaded:", bool(ZENDESK_API_TOKEN), file=sys.stderr)
-# ----------------------------------------------
 
 # ----------------- APP DEFINITION -----------------
 app = FastAPI(title="MCP Web API")
@@ -31,12 +27,26 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-# ----------------------------------------------
+
+# -------- STARTUP LOGGING --------
+@app.on_event("startup")
+async def startup_event():
+    email_loaded = bool(ZENDESK_EMAIL)
+    token_loaded = bool(ZENDESK_API_TOKEN)
+    subdomain = ZENDESK_SUBDOMAIN
+
+    token_display = "****" + ZENDESK_API_TOKEN[-4:] if token_loaded else None
+    email_display = ZENDESK_EMAIL if email_loaded else "None"
+
+    print(f"[STARTUP] Zendesk Email Loaded: {email_loaded} ({email_display})", file=sys.stderr)
+    print(f"[STARTUP] Zendesk API Token Loaded: {token_loaded} ({token_display})", file=sys.stderr)
+    print(f"[STARTUP] Zendesk Subdomain: {subdomain}", file=sys.stderr)
+
 
 # -------- Helper: Zendesk Auth Header ----------
 def zendesk_headers():
     if not ZENDESK_EMAIL or not ZENDESK_API_TOKEN:
-        return None
+        raise HTTPException(status_code=500, detail="Zendesk credentials not set in environment")
 
     token = f"{ZENDESK_EMAIL}/token:{ZENDESK_API_TOKEN}"
     encoded = base64.b64encode(token.encode()).decode()
@@ -46,7 +56,6 @@ def zendesk_headers():
         "Content-Type": "application/json",
         "User-Agent": "MCP-Web"
     }
-# ----------------------------------------------
 
 # -------- Request Models --------
 class QueryRequest(BaseModel):
@@ -54,7 +63,6 @@ class QueryRequest(BaseModel):
 
 class TicketRequest(BaseModel):
     ticket_id: int
-# --------------------------------
 
 # -------- ROUTES --------
 @app.get("/debug/env")
@@ -65,50 +73,33 @@ def debug_env():
         "subdomain": ZENDESK_SUBDOMAIN,
     }
 
-
 @app.post("/search/docs")
 async def search_docs(req: QueryRequest):
     """Search CAST documentation"""
     try:
         with DDGS() as ddgs:
-            results = ddgs.text(
-                f"site:doc.castsoftware.com {req.query}",
-                max_results=5
-            )
+            results = ddgs.text(f"site:doc.castsoftware.com {req.query}", max_results=5)
 
             if not results:
                 return {"result": "No documentation found."}
 
-            output = []
-            for r in results:
-                output.append(
-                    f"Title: {r['title']}\n"
-                    f"Link: {r['href']}\n"
-                    f"Snippet: {r['body']}\n"
-                    "----------------------"
-                )
-
+            output = [
+                f"Title: {r['title']}\nLink: {r['href']}\nSnippet: {r['body']}\n----------------------"
+                for r in results
+            ]
             return {"result": "\n".join(output)}
 
     except Exception as e:
         return {"result": f"Error: {e}"}
 
-
 @app.post("/search/tickets")
 async def search_tickets(req: QueryRequest):
     """Search Zendesk tickets"""
     headers = zendesk_headers()
-    if not headers:
-        return {"result": "Zendesk credentials missing."}
-
     url = f"https://{ZENDESK_SUBDOMAIN}.zendesk.com/api/v2/search.json"
 
     async with httpx.AsyncClient() as client:
-        resp = await client.get(
-            url,
-            params={"query": f"type:ticket {req.query}"},
-            headers=headers,
-        )
+        resp = await client.get(url, params={"query": f"type:ticket {req.query}"}, headers=headers)
 
         if resp.status_code == 401:
             return {"result": "Zendesk authentication failed."}
@@ -117,20 +108,13 @@ async def search_tickets(req: QueryRequest):
         if not results:
             return {"result": "No tickets found."}
 
-        lines = [
-            f"ID: {t['id']} | {t['subject']}"
-            for t in results[:5]
-        ]
-
+        lines = [f"ID: {t['id']} | {t['subject']}" for t in results[:5]]
         return {"result": "\n".join(lines)}
-
 
 @app.post("/ticket/details")
 async def ticket_details(req: TicketRequest):
     """Get full ticket details"""
     headers = zendesk_headers()
-    if not headers:
-        return {"result": "Zendesk credentials missing."}
 
     async with httpx.AsyncClient() as client:
         t_resp = await client.get(
@@ -153,8 +137,7 @@ async def ticket_details(req: TicketRequest):
         comments = c_resp.json().get("comments", [])
 
         history = "\n\n".join(
-            f"User {c['author_id']}:\n{c.get('plain_body','')}"
-            for c in comments
+            f"User {c['author_id']}:\n{c.get('plain_body','')}" for c in comments
         )
 
         output = (
@@ -166,7 +149,6 @@ async def ticket_details(req: TicketRequest):
         )
 
         return {"result": output}
-
 
 @app.get("/")
 def health():
