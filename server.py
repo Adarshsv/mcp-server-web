@@ -7,10 +7,10 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from duckduckgo_search import DDGS
 
-# ------------------ ENV SETUP ------------------
+# ------------------ ENV ------------------
 ZENDESK_SUBDOMAIN = os.getenv("ZENDESK_SUBDOMAIN", "castsoftware")
 
-# ----------------- APP -----------------
+# ------------------ APP ------------------
 app = FastAPI(title="MCP Web API")
 
 app.add_middleware(
@@ -20,20 +20,18 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ---------------- STARTUP LOG ----------------
+# ------------------ STARTUP ------------------
 @app.on_event("startup")
 async def startup():
-    print("[STARTUP] Zendesk Email Loaded:", bool(os.getenv("ZENDESK_EMAIL")), file=sys.stderr)
-    print("[STARTUP] Zendesk API Token Loaded:", bool(os.getenv("ZENDESK_API_TOKEN")), file=sys.stderr)
-    print("[STARTUP] Zendesk Subdomain:", ZENDESK_SUBDOMAIN, file=sys.stderr)
+    print("[STARTUP] Zendesk Email:", bool(os.getenv("ZENDESK_EMAIL")), file=sys.stderr)
+    print("[STARTUP] Zendesk Token:", bool(os.getenv("ZENDESK_API_TOKEN")), file=sys.stderr)
 
-# ---------------- AUTH ----------------
+# ------------------ AUTH ------------------
 def zendesk_headers():
     email = os.getenv("ZENDESK_EMAIL")
     token = os.getenv("ZENDESK_API_TOKEN")
-
     if not email or not token:
-        raise HTTPException(status_code=500, detail="Zendesk credentials not set")
+        raise HTTPException(500, "Zendesk credentials missing")
 
     auth = base64.b64encode(f"{email}/token:{token}".encode()).decode()
     return {
@@ -42,71 +40,46 @@ def zendesk_headers():
         "User-Agent": "MCP-Web",
     }
 
-# ---------------- MODELS ----------------
-class QueryRequest(BaseModel):
-    query: str
-
+# ------------------ MODELS ------------------
 class TicketRequest(BaseModel):
     ticket_id: int
 
-# ---------------- DEBUG ----------------
-@app.get("/debug/zendesk")
-def debug_zendesk():
-    return {
-        "email": os.getenv("ZENDESK_EMAIL"),
-        "token": os.getenv("ZENDESK_API_TOKEN"),
-        "subdomain": ZENDESK_SUBDOMAIN,
-    }
+class QueryRequest(BaseModel):
+    query: str
 
-# ---------------- DOC SEARCH ----------------
-def search_docs_internal(query: str):
-    results = []
+# ------------------ HELPERS ------------------
+def extract_keywords(text: str, limit=20):
+    words = [w for w in text.replace("\n", " ").split() if len(w) > 4]
+    return " ".join(words[:limit])
+
+def search_docs(query: str):
+    docs = []
     with DDGS() as ddgs:
         for r in ddgs.text(f"site:doc.castsoftware.com {query}", max_results=5):
-            results.append({
+            docs.append({
                 "title": r["title"],
                 "url": r["href"],
-                "snippet": r["body"]
+                "snippet": r["body"],
             })
-    return results
+    return docs
 
-# ---------------- TICKET SEARCH ----------------
-async def search_tickets_internal(query: str):
+async def search_tickets(query: str):
     headers = zendesk_headers()
     url = f"https://{ZENDESK_SUBDOMAIN}.zendesk.com/api/v2/search.json"
 
     async with httpx.AsyncClient() as client:
         r = await client.get(url, params={"query": query}, headers=headers)
 
-    tickets = []
+    results = []
     for t in r.json().get("results", []):
-        tickets.append({
+        results.append({
             "id": t["id"],
             "subject": t["subject"],
-            "status": t["status"]
+            "status": t["status"],
         })
+    return results
 
-    return tickets
-
-# ---------------- ALL SEARCH ----------------
-@app.post("/search/all")
-async def search_all(req: QueryRequest):
-    tickets = await search_tickets_internal(req.query)
-    docs = search_docs_internal(req.query)
-
-    summary = (
-        f"Searched across Zendesk tickets (including comments) and CAST documentation.\n"
-        f"Found {len(tickets)} related tickets and {len(docs)} documentation references."
-    )
-
-    return {
-        "query": req.query,
-        "summary": summary,
-        "tickets": {"count": len(tickets), "results": tickets},
-        "docs": {"count": len(docs), "results": docs},
-    }
-
-# ---------------- TICKET DETAILS (SMART) ----------------
+# ------------------ TICKET DETAILS ------------------
 @app.post("/ticket/details")
 async def ticket_details(req: TicketRequest):
     headers = zendesk_headers()
@@ -124,44 +97,50 @@ async def ticket_details(req: TicketRequest):
     ticket = t.json()["ticket"]
     comments = c.json().get("comments", [])
 
-    # ---------- BUILD SEARCH TEXT ----------
-    comment_text = " ".join(c.get("plain_body", "") for c in comments)
-    search_text = f"{ticket['subject']} {ticket.get('description','')} {comment_text}"
-    keywords = " ".join(search_text.split()[:12])
+    # ---------- TEXT AGGREGATION ----------
+    history_text = " ".join(c.get("plain_body", "") for c in comments)
+    combined_text = f"{ticket['subject']} {ticket.get('description','')} {history_text}"
+
+    keywords = extract_keywords(combined_text)
 
     # ---------- CROSS SEARCH ----------
-    related_tickets = await search_tickets_internal(keywords)
-    related_docs = search_docs_internal(keywords)
+    related_tickets = await search_tickets(keywords)
+    related_docs = search_docs(keywords)
 
-    # ---------- SUMMARY (ALWAYS) ----------
-    summary = (
-        f"Issue Summary:\n"
-        f"{ticket['subject']}\n\n"
-        f"Analysis:\n"
-        f"- Ticket history reviewed ({len(comments)} comments)\n"
-        f"- Related tickets found: {len(related_tickets)}\n"
-        f"- Relevant documentation found: {len(related_docs)}\n\n"
-    )
+    # ---------- STRUCTURED SUMMARY ----------
+    summary = f"""
+Problem:
+{ticket['subject']}
+
+Observed Behavior:
+This issue was discussed across {len(comments)} ticket comments. The problem persists or required clarification across multiple interactions.
+
+Similar Issues:
+{len(related_tickets)} related tickets were found. This suggests the issue may be recurring or previously investigated.
+
+Documentation Insight:
+{len(related_docs)} relevant documentation references were identified.
+
+Suggested Resolution:
+"""
 
     if related_tickets:
         summary += (
-            "Suggested Solution:\n"
-            "This issue appears to be previously reported. "
-            "Review similar resolved tickets for an existing workaround or fix.\n"
+            "- Review similar resolved tickets for confirmed workarounds or fixes.\n"
+            "- Validate whether the resolution applies to the current product version.\n"
         )
     elif related_docs:
         summary += (
-            "Suggested Solution:\n"
-            "Documentation suggests this is a known configuration or compatibility issue. "
-            "Validate against the referenced CAST documentation.\n"
+            "- Follow configuration or compatibility guidance from CAST documentation.\n"
+            "- Verify product version alignment.\n"
         )
     else:
         summary += (
-            "Suggested Solution:\n"
-            "No direct matches found. Recommend escalation to R&D with logs and reproduction steps.\n"
+            "- No direct match found.\n"
+            "- Collect logs, reproduction steps, and escalate to R&D.\n"
         )
 
-    # ---------- HTML OUTPUT ----------
+    # ---------- HTML ----------
     history_html = "".join(
         f"<p><b>User {c['author_id']}:</b><br>{c.get('plain_body','')}</p>"
         for c in comments
@@ -169,13 +148,12 @@ async def ticket_details(req: TicketRequest):
 
     html = f"""
     <h2>TICKET #{ticket['id']}</h2>
-    <b>Status:</b> {ticket['status']}<br>
-    <b>Priority:</b> {ticket.get('priority')}<br><br>
+    <b>Status:</b> {ticket['status']}<br><br>
 
     <h3>Description</h3>
     <pre>{ticket.get('description','')}</pre>
 
-    <h3>Suggested Solution</h3>
+    <h3>Summary & Suggested Resolution</h3>
     <pre>{summary}</pre>
 
     <h3>History</h3>
@@ -183,13 +161,32 @@ async def ticket_details(req: TicketRequest):
     """
 
     return {
-        "summary": summary,
+        "summary": summary.strip(),
         "related_tickets": related_tickets,
         "related_docs": related_docs,
         "html": html,
     }
 
-# ---------------- HEALTH ----------------
+# ------------------ SEARCH ALL ------------------
+@app.post("/search/all")
+async def search_all(req: QueryRequest):
+    tickets = await search_tickets(req.query)
+    docs = search_docs(req.query)
+
+    summary = (
+        f"Searched tickets (including comments) and documentation.\n"
+        f"Tickets found: {len(tickets)}\n"
+        f"Docs found: {len(docs)}\n"
+    )
+
+    return {
+        "query": req.query,
+        "summary": summary,
+        "tickets": tickets,
+        "docs": docs,
+    }
+
+# ------------------ HEALTH ------------------
 @app.get("/")
 def health():
     return {"status": "ok"}
