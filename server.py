@@ -1,5 +1,6 @@
 import os
 import sys
+import base64
 import httpx
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -11,10 +12,12 @@ from dotenv import load_dotenv
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 load_dotenv(os.path.join(BASE_DIR, ".env"))
 
-ZENDESK_COOKIE = os.getenv("ZENDESK_COOKIE")
-ZENDESK_SUBDOMAIN = "castsoftware"
+ZENDESK_EMAIL = os.getenv("ZENDESK_EMAIL")
+ZENDESK_API_TOKEN = os.getenv("ZENDESK_API_TOKEN")
+ZENDESK_SUBDOMAIN = os.getenv("ZENDESK_SUBDOMAIN", "castsoftware")
 
-print("Cookie loaded:", bool(ZENDESK_COOKIE), file=sys.stderr)
+print("Zendesk email loaded:", bool(ZENDESK_EMAIL), file=sys.stderr)
+print("Zendesk API token loaded:", bool(ZENDESK_API_TOKEN), file=sys.stderr)
 # ----------------------------------------------
 
 app = FastAPI(title="MCP Web API")
@@ -22,10 +25,25 @@ app = FastAPI(title="MCP Web API")
 # -------- CORS (required for Vercel UI) --------
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],   # safe for internal tools
+    allow_origins=["*"],   # OK for internal tooling
     allow_methods=["*"],
     allow_headers=["*"],
 )
+# ----------------------------------------------
+
+# -------- Helper: Zendesk Auth Header ----------
+def zendesk_headers():
+    if not ZENDESK_EMAIL or not ZENDESK_API_TOKEN:
+        return None
+
+    token = f"{ZENDESK_EMAIL}/token:{ZENDESK_API_TOKEN}"
+    encoded = base64.b64encode(token.encode()).decode()
+
+    return {
+        "Authorization": f"Basic {encoded}",
+        "Content-Type": "application/json",
+        "User-Agent": "MCP-Web"
+    }
 # ----------------------------------------------
 
 # -------- Request Models --------
@@ -35,6 +53,7 @@ class QueryRequest(BaseModel):
 class TicketRequest(BaseModel):
     ticket_id: int
 # --------------------------------
+
 
 @app.post("/search/docs")
 async def search_docs(req: QueryRequest):
@@ -67,11 +86,11 @@ async def search_docs(req: QueryRequest):
 @app.post("/search/tickets")
 async def search_tickets(req: QueryRequest):
     """Search Zendesk tickets"""
-    if not ZENDESK_COOKIE:
-        return {"result": "Zendesk cookie missing."}
+    headers = zendesk_headers()
+    if not headers:
+        return {"result": "Zendesk credentials missing."}
 
     url = f"https://{ZENDESK_SUBDOMAIN}.zendesk.com/api/v2/search.json"
-    headers = {"Cookie": ZENDESK_COOKIE, "User-Agent": "MCP-Web"}
 
     async with httpx.AsyncClient() as client:
         resp = await client.get(
@@ -81,7 +100,7 @@ async def search_tickets(req: QueryRequest):
         )
 
         if resp.status_code == 401:
-            return {"result": "Zendesk cookie expired."}
+            return {"result": "Zendesk authentication failed."}
 
         results = resp.json().get("results", [])
         if not results:
@@ -98,10 +117,10 @@ async def search_tickets(req: QueryRequest):
 @app.post("/ticket/details")
 async def ticket_details(req: TicketRequest):
     """Get full ticket details"""
-    if not ZENDESK_COOKIE:
-        return {"result": "Zendesk cookie missing."}
+    headers = zendesk_headers()
+    if not headers:
+        return {"result": "Zendesk credentials missing."}
 
-    headers = {"Cookie": ZENDESK_COOKIE, "User-Agent": "MCP-Web"}
     async with httpx.AsyncClient() as client:
         t_resp = await client.get(
             f"https://{ZENDESK_SUBDOMAIN}.zendesk.com/api/v2/tickets/{req.ticket_id}.json",
@@ -109,7 +128,7 @@ async def ticket_details(req: TicketRequest):
         )
 
         if t_resp.status_code == 401:
-            return {"result": "Zendesk cookie expired."}
+            return {"result": "Zendesk authentication failed."}
         if t_resp.status_code == 404:
             return {"result": "Ticket not found."}
 
