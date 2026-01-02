@@ -1,144 +1,58 @@
 import os
-import sys
+import re
 import base64
 import httpx
-from fastapi import FastAPI, HTTPException, Response
+from typing import List
+from fastapi import FastAPI, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from duckduckgo_search import DDGS
 
-# Optional: OpenAI for AI summary
-try:
-    import openai
-    OPENAI_KEY = os.getenv("OPENAI_API_KEY")
-    if OPENAI_KEY:
-        openai.api_key = OPENAI_KEY
-except ImportError:
-    openai = None
-    OPENAI_KEY = None
+# ---------------- CONFIG ----------------
+ZENDESK_SUBDOMAIN = os.getenv("ZENDESK_SUBDOMAIN")
+ZENDESK_EMAIL = os.getenv("ZENDESK_EMAIL")
+ZENDESK_API_TOKEN = os.getenv("ZENDESK_API_TOKEN")
+OPTIONAL_API_KEY = os.getenv("API_KEY")  # optional
 
-# ------------------ ENV ------------------
-ZENDESK_SUBDOMAIN = os.getenv("ZENDESK_SUBDOMAIN", "castsoftware")
+ZENDESK_BASE = f"https://{ZENDESK_SUBDOMAIN}.zendesk.com/api/v2"
 
-# ------------------ APP ------------------
-app = FastAPI(title="MCP Web API")
+auth = base64.b64encode(
+    f"{ZENDESK_EMAIL}/token:{ZENDESK_API_TOKEN}".encode()
+).decode()
+
+ZENDESK_HEADERS = {
+    "Authorization": f"Basic {auth}",
+    "Content-Type": "application/json"
+}
+
+# ---------------- APP ----------------
+app = FastAPI(title="Zendesk Intelligence API")
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_methods=["*"],
     allow_headers=["*"],
+    allow_methods=["*"],
 )
 
-# ------------------ STARTUP ------------------
-@app.on_event("startup")
-async def startup():
-    print("[STARTUP] Zendesk Email:", bool(os.getenv("ZENDESK_EMAIL")), file=sys.stderr)
-    print("[STARTUP] Zendesk Token:", bool(os.getenv("ZENDESK_API_TOKEN")), file=sys.stderr)
-    if OPENAI_KEY:
-        print("[STARTUP] OpenAI API available for AI summaries", file=sys.stderr)
-    else:
-        print("[STARTUP] OpenAI API key not set, AI summaries disabled", file=sys.stderr)
-
-# ------------------ AUTH ------------------
-def zendesk_headers():
-    email = os.getenv("ZENDESK_EMAIL")
-    token = os.getenv("ZENDESK_API_TOKEN")
-    if not email or not token:
-        raise HTTPException(500, "Zendesk credentials missing")
-
-    auth = base64.b64encode(f"{email}/token:{token}".encode()).decode()
-    return {
-        "Authorization": f"Basic {auth}",
-        "Content-Type": "application/json",
-        "User-Agent": "MCP-Web",
-    }
-
-# ------------------ MODELS ------------------
+# ---------------- MODELS ----------------
 class TicketRequest(BaseModel):
     ticket_id: int
 
-class QueryRequest(BaseModel):
+class SearchRequest(BaseModel):
     query: str
 
-# ------------------ HELPERS ------------------
-def extract_keywords(text: str, limit=20):
-    words = [w for w in text.replace("\n", " ").split() if len(w) > 4]
-    return " ".join(words[:limit])
+# ---------------- HELPERS ----------------
+async def zendesk_get(client, path):
+    r = await client.get(f"{ZENDESK_BASE}{path}", headers=ZENDESK_HEADERS)
+    r.raise_for_status()
+    return r.json()
 
-def search_docs(query: str):
-    docs = []
-    with DDGS() as ddgs:
-        for r in ddgs.text(f"site:doc.castsoftware.com {query}", max_results=5):
-            docs.append({
-                "title": r["title"],
-                "url": r["href"],
-                "snippet": r["body"],
-            })
-    return docs
+def extract_keywords(text: str) -> List[str]:
+    words = re.findall(r"[A-Za-z0-9\.\+\-]{4,}", text)
+    return list(set(words))[:12]
 
-async def search_tickets(query: str):
-    headers = zendesk_headers()
-    url = f"https://{ZENDESK_SUBDOMAIN}.zendesk.com/api/v2/search.json"
-
-    async with httpx.AsyncClient() as client:
-        r = await client.get(url, params={"query": query}, headers=headers)
-
-    results = []
-    for t in r.json().get("results", []):
-        results.append({
-            "id": t["id"],
-            "subject": t["subject"],
-            "status": t["status"],
-        })
-    return results
-
-async def ai_summary_fallback(text: str):
-    """Generate a short AI summary if OpenAI key is set"""
-    if not OPENAI_KEY or not openai:
-        return None
-    try:
-        resp = openai.ChatCompletion.create(
-            model="gpt-4",
-            messages=[{"role": "user", "content": f"Summarize this issue with resolution suggestions:\n{text}"}],
-            temperature=0.2,
-        )
-        return resp.choices[0].message.content
-    except Exception as e:
-        return f"AI summary failed: {e}"
-
-# ------------------ TICKET DETAILS ------------------
-@app.post("/ticket/details")
-async def ticket_details(req: TicketRequest):
-    headers = zendesk_headers()
-
-    async with httpx.AsyncClient() as client:
-        t = await client.get(
-            f"https://{ZENDESK_SUBDOMAIN}.zendesk.com/api/v2/tickets/{req.ticket_id}.json",
-            headers=headers,
-        )
-        c = await client.get(
-            f"https://{ZENDESK_SUBDOMAIN}.zendesk.com/api/v2/tickets/{req.ticket_id}/comments.json",
-            headers=headers,
-        )
-
-    ticket = t.json()["ticket"]
-    comments = c.json().get("comments", [])
-
-    history_text = " ".join(c.get("plain_body", "") for c in comments)
-    combined_text = f"{ticket['subject']} {ticket.get('description','')} {history_text}"
-
-    keywords = extract_keywords(combined_text)
-    related_tickets = await search_tickets(keywords)
-    related_docs = search_docs(keywords)
-
-    # Fallback AI summary
-    ai_summary = await ai_summary_fallback(combined_text) or "No AI summary available, fallback applied."
-
-    # Confidence score (simple heuristic)
-    confidence = min(1.0, max(0.1, len(related_tickets)/10 + len(related_docs)/10))
-
-    # Structured summary
-    summary = f"""
+def build_fallback_summary(ticket, comments, related_tickets, related_docs):
+    return f"""
 Issue Summary:
 {ticket['subject']}
 
@@ -152,81 +66,127 @@ Documentation Insights:
 {len(related_docs)} relevant docs found.
 
 Suggested Resolution:
-{ai_summary}
+Review previous tickets and documentation. Similar cases often require upgrade,
+configuration change, or product limitation acknowledgment.
 
-Confidence Score: {confidence:.2f}
-"""
+Confidence Score: {min(0.9, 0.1 + len(related_tickets) * 0.2)}
+""".strip()
 
-    history_html = "".join(
-        f"<p><b>User {c['author_id']}:</b><br>{c.get('plain_body','')}</p>" for c in comments
-    )
+# ---------------- ROUTES ----------------
+@app.post("/ticket/details")
+async def ticket_details(
+    req: TicketRequest,
+    x_api_key: str | None = Header(default=None)
+):
+    if OPTIONAL_API_KEY and x_api_key and x_api_key != OPTIONAL_API_KEY:
+        raise HTTPException(401, "Invalid API key")
 
-    html = f"""
-    <h2>TICKET #{ticket['id']}</h2>
-    <b>Status:</b> {ticket['status']}<br><br>
+    async with httpx.AsyncClient(timeout=30) as client:
+        ticket = (await zendesk_get(client, f"/tickets/{req.ticket_id}.json"))["ticket"]
+        comments = (await zendesk_get(
+            client, f"/tickets/{req.ticket_id}/comments.json"
+        ))["comments"]
 
-    <h3>Description</h3>
-    <pre>{ticket.get('description','')}</pre>
+        full_text = ticket["subject"] + " " + ticket.get("description", "")
+        for c in comments:
+            full_text += " " + c.get("body", "")
 
-    <h3>Summary & Suggested Resolution</h3>
-    <pre>{summary}</pre>
+        keywords = extract_keywords(full_text)
+        query = " ".join(keywords)
 
-    <h3>History</h3>
-    {history_html}
-    """
+        search = await zendesk_get(
+            client,
+            f"/search.json?query=type:ticket {query}"
+        )
 
-    return {
-        "summary": summary.strip(),
-        "confidence": confidence,
-        "related_tickets": related_tickets,
-        "related_docs": related_docs,
-        "html": html,
-    }
+        related_tickets = [
+            {
+                "id": t["id"],
+                "subject": t["subject"],
+                "status": t["status"]
+            }
+            for t in search["results"]
+            if t["id"] != req.ticket_id
+        ][:5]
 
-# ------------------ SEARCH ALL ------------------
+        # Docs (best effort – Zendesk Guide)
+        docs = []
+        try:
+            doc_search = await zendesk_get(
+                client,
+                f"/help_center/articles/search.json?query={query}"
+            )
+            docs = doc_search.get("results", [])[:5]
+        except:
+            pass
+
+        summary = build_fallback_summary(
+            ticket, comments, related_tickets, docs
+        )
+
+        confidence = min(0.9, 0.1 + len(related_tickets) * 0.2)
+
+        # -------- HTML --------
+        html = f"<h2>TICKET #{ticket['id']}</h2>"
+        html += f"<b>Status:</b> {ticket['status']}<br><br>"
+        html += f"<h3>Description</h3><pre>{ticket.get('description','')}</pre>"
+        html += f"<h3>Summary & Suggested Resolution</h3><pre>{summary}</pre>"
+        html += "<h3>History</h3>"
+
+        for c in comments:
+            html += f"<p><b>User {c['author_id']}:</b><br>{c['body']}</p>"
+
+        return {
+            "summary": summary,
+            "confidence": confidence,
+            "related_tickets": related_tickets,
+            "related_docs": docs,
+            "html": html
+        }
+
 @app.post("/search/all")
-async def search_all(req: QueryRequest):
-    tickets = await search_tickets(req.query)
-    docs = search_docs(req.query)
+async def search_all(
+    req: SearchRequest,
+    x_api_key: str | None = Header(default=None)
+):
+    if OPTIONAL_API_KEY and x_api_key and x_api_key != OPTIONAL_API_KEY:
+        raise HTTPException(401, "Invalid API key")
 
-    summary = f"Searched tickets and docs for: {req.query}\nTickets: {len(tickets)}, Docs: {len(docs)}"
-    return {
-        "query": req.query,
-        "summary": summary,
-        "tickets": tickets,
-        "docs": docs,
-    }
+    async with httpx.AsyncClient(timeout=30) as client:
+        ticket_search = await zendesk_get(
+            client,
+            f"/search.json?query=type:ticket {req.query}"
+        )
 
-# ------------------ PDF EXPORT ------------------
-@app.post("/ticket/html-to-pdf")
-async def html_to_pdf(req: dict):
-    """Return PDF bytes from HTML content"""
-    from weasyprint import HTML
-    html_content = req.get("html")
-    if not html_content:
-        raise HTTPException(400, "Missing HTML content")
+        doc_search = []
+        try:
+            docs = await zendesk_get(
+                client,
+                f"/help_center/articles/search.json?query={req.query}"
+            )
+            doc_search = docs.get("results", [])
+        except:
+            pass
 
-    pdf_bytes = HTML(string=html_content).write_pdf()
-    return Response(content=pdf_bytes, media_type="application/pdf")
+        summary = f"""
+Search Keyword: "{req.query}"
 
-# ------------------ DEBUG ------------------
-@app.get("/debug/env")
-def debug_env():
-    return {
-        "email": bool(os.getenv("ZENDESK_EMAIL")),
-        "token": bool(os.getenv("ZENDESK_API_TOKEN")),
-        "subdomain": ZENDESK_SUBDOMAIN,
-    }
+Tickets Found: {len(ticket_search['results'])}
+Documents Found: {len(doc_search)}
 
-@app.get("/debug/zendesk")
-def debug_zendesk():
-    return {
-        "email": os.getenv("ZENDESK_EMAIL"),
-        "token": os.getenv("ZENDESK_API_TOKEN"),
-        "subdomain": ZENDESK_SUBDOMAIN
-    }
+Suggested Action:
+Review similar tickets and documentation to identify recurring solutions.
+""".strip()
 
-# ------------------ HEALTH ------------------
-@app.get("/")
-def health():
-    return {"status": "ok"}
+        return {
+            "query": req.query,
+            "summary": summary,
+            "tickets": {
+                "count": len(ticket_search["results"]),
+                "results": ticket_search["results"][:10]
+            },
+            "docs": {
+                "count": len(doc_search),
+                "results": doc_search[:10]
+            }
+        }
