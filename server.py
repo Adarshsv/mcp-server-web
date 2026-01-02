@@ -8,7 +8,6 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 from duckduckgo_search import DDGS
-import re
 
 # ------------------ ENV SETUP ------------------
 ZENDESK_SUBDOMAIN = os.getenv("ZENDESK_SUBDOMAIN", "castsoftware")
@@ -67,7 +66,7 @@ def summarize_comments(comments):
     if not comments:
         return ""
     snippets = []
-    for c in comments[:5]:
+    for c in comments[:5]:  # limit to top 5 comments
         body = c.get("plain_body") or c.get("body", "")
         if body:
             snippets.append(body.strip().replace("\n", " "))
@@ -75,21 +74,35 @@ def summarize_comments(comments):
 
 # -------- Helper: Shorten Summary to 4-5 sentences ----------
 def shorten_summary(text):
-    sentences = re.split(r'\. |\n', text)
+    sentences = text.split(". ")
     shortened = ". ".join(sentences[:5])
     if len(sentences) > 5:
         shortened += " ..."
     return shortened
 
-# -------- Helper: Highlight Keywords ----------
-def highlight_keywords(text, keywords):
-    for kw in keywords:
-        if kw.strip():
-            pattern = re.compile(re.escape(kw), re.IGNORECASE)
-            text = pattern.sub(lambda m: f"<mark>{m.group(0)}</mark>", text)
-    return text
+# -------- Helper: Fetch Documentation with Caching ----------
+DOC_CACHE = {}
 
-# -------- Shared Helper: Build Summary --------
+def fetch_docs(query):
+    if query in DOC_CACHE:
+        return DOC_CACHE[query]
+
+    docs = []
+    try:
+        with DDGS() as ddgs:
+            results = ddgs.text(f"site:doc.castsoftware.com {query}", max_results=5)
+            for r in results:
+                title = r.get("title") or r.get("body") or "Documentation"
+                url = r.get("href") or ""
+                if url:
+                    docs.append({"title": title, "url": url})
+    except Exception:
+        pass
+
+    DOC_CACHE[query] = docs
+    return docs
+
+# -------- Shared Helper: Build Summary ----------
 async def generate_summary(query=None, ticket_ids=None):
     related_tickets = []
     related_docs = []
@@ -115,6 +128,7 @@ async def generate_summary(query=None, ticket_ids=None):
                 comments = c_resp.json().get("comments", [])
                 summarized_comments += summarize_comments(comments) + " "
         elif query:
+            # Search by keyword
             try:
                 resp = await client.get(
                     f"https://{ZENDESK_SUBDOMAIN}.zendesk.com/api/v2/search.json",
@@ -129,6 +143,7 @@ async def generate_summary(query=None, ticket_ids=None):
                         "subject": t["subject"],
                         "url": f"https://{ZENDESK_SUBDOMAIN}.zendesk.com/agent/tickets/{t['id']}"
                     })
+                # summarize comments
                 comments_responses = await asyncio.gather(*[
                     client.get(
                         f"https://{ZENDESK_SUBDOMAIN}.zendesk.com/api/v2/tickets/{t['id']}/comments.json",
@@ -143,13 +158,7 @@ async def generate_summary(query=None, ticket_ids=None):
 
         # -------- Fetch Related Docs --------
         if query:
-            try:
-                with DDGS() as ddgs:
-                    docs = ddgs.text(f"site:doc.castsoftware.com {query}", max_results=3)
-                    for d in docs:
-                        related_docs.append({"title": d["title"], "url": d["href"]})
-            except Exception:
-                pass
+            related_docs = fetch_docs(query)
 
         # -------- Generate Recommended Solution --------
         if related_tickets or related_docs:
@@ -165,15 +174,13 @@ async def generate_summary(query=None, ticket_ids=None):
             )
 
         # -------- Build Summary Text --------
-        shortened_summary = shorten_summary(summarized_comments.strip() or "No ticket comments found.")
-        highlighted_summary = highlight_keywords(shortened_summary, query.split() if query else [])
-
-        summary_lines = [
-            f"Observed Behavior: {highlighted_summary}",
-            f"Similar Issues: {len(related_tickets)} related tickets found.",
-            f"Documentation References: {len(related_docs)} docs found.",
-            f"Suggested Resolution: {recommended_solution}"
-        ]
+        summary_lines = []
+        if query:
+            summary_lines.append(f"Search Query: {query}")
+        summary_lines.append(f"Observed Behavior: {shorten_summary(summarized_comments.strip() or 'No ticket comments found.')}")
+        summary_lines.append(f"Similar Issues: {len(related_tickets)} related tickets found.")
+        summary_lines.append(f"Documentation References: {len(related_docs)} docs found.")
+        summary_lines.append(f"Suggested Resolution: {recommended_solution}")
 
         summary_text = "\n\n".join(summary_lines)
         confidence = round(min(0.3 + len(related_tickets) * 0.15, 0.9), 2)
@@ -210,24 +217,16 @@ def home():
     <!DOCTYPE html>
     <html>
     <head>
-        <title>MCP Support Dashboard</title>
+        <title>MCP Web</title>
         <style>
-            body { font-family: Arial, sans-serif; background: #f4f4f4; padding: 20px; max-width: 1000px; margin: auto; }
-            h1 { text-align: center; }
-            input, button { padding: 10px; margin: 5px 0; width: 100%; max-width: 400px; border-radius: 5px; border: 1px solid #ccc; }
-            button { cursor: pointer; background: #007bff; color: #fff; border: none; }
-            button:hover { background: #0056b3; }
-            .result { margin-top: 20px; }
-            .card { background: #fff; border-radius: 8px; padding: 15px; margin-bottom: 15px; box-shadow: 0 2px 5px rgba(0,0,0,0.1); }
-            .card a { text-decoration: none; color: #007bff; }
-            .section-title { font-weight: bold; margin-bottom: 10px; }
-            pre { white-space: pre-wrap; word-wrap: break-word; }
-            mark { background-color: #ffff00; font-weight: bold; }
+            body { font-family: Arial, sans-serif; padding: 20px; max-width: 900px; margin: auto; }
+            input, button { padding: 8px; margin: 5px 0; width: 100%; }
+            .result { border: 1px solid #ccc; padding: 15px; margin-top: 20px; white-space: pre-wrap; }
+            h2 { margin-top: 0; }
         </style>
     </head>
     <body>
-        <h1>CAST Support Dashboard</h1>
-
+        <h2>CAST Support Assistant</h2>
         <label>Ticket ID (optional):</label>
         <input type="number" id="ticket_id" placeholder="Enter ticket ID">
         <label>Or Search Query:</label>
@@ -241,7 +240,7 @@ def home():
                 const ticketId = document.getElementById('ticket_id').value;
                 const query = document.getElementById('query').value;
                 const resultDiv = document.getElementById('result');
-                resultDiv.innerHTML = "<p>Loading...</p>";
+                resultDiv.innerText = "Loading...";
 
                 let url, body;
                 if (ticketId) {
@@ -251,7 +250,7 @@ def home():
                     url = '/search/all';
                     body = JSON.stringify({ query: query });
                 } else {
-                    resultDiv.innerHTML = "<p>Please enter ticket ID or search query!</p>";
+                    resultDiv.innerText = "Please enter ticket ID or search query!";
                     return;
                 }
 
@@ -262,46 +261,25 @@ def home():
                         body: body
                     });
                     if (!response.ok) {
-                        resultDiv.innerHTML = "<p>Error: " + response.statusText + "</p>";
+                        resultDiv.innerText = "Error: " + response.statusText;
                         return;
                     }
                     const data = await response.json();
-
-                    let html = `<div class="card"><div class="section-title">Summary</div><pre>${data.summary}</pre></div>`;
-
-                    // Confidence color-coded
-                    let confidenceColor = data.confidence > 0.7 ? "green" : data.confidence > 0.5 ? "orange" : "red";
-                    html += `<div class="card"><div class="section-title">Confidence</div><pre style="color:${confidenceColor}">${data.confidence}</pre></div>`;
-
-                    html += `<div class="card"><div class="section-title">Related Tickets</div>`;
-                    if (data.related_tickets.length > 0) {
-                        data.related_tickets.forEach(t => {
-                            const title = t.subject || "Ticket " + t.id;
-                            html += `<p><a href="${t.url}" target="_blank">${title}</a></p>`;
-                        });
-                    } else {
-                        html += "<p>No related tickets found.</p>";
-                    }
-                    html += "</div>";
-
-                    html += `<div class="card"><div class="section-title">Related Documentation</div>`;
-                    if (data.related_docs.length > 0) {
-                        data.related_docs.forEach(d => {
-                            html += `<p><a href="${d.url}" target="_blank">${d.title}</a></p>`;
-                        });
-                    } else {
-                        html += "<p>No related documentation found.</p>";
-                    }
-                    html += "</div>";
-
-                    html += `<div class="card"><div class="section-title">Recommended Solution</div><pre>${data.recommended_solution}</pre></div>`;
-
-                    resultDiv.innerHTML = html;
+                    let html = `Summary:\\n${data.summary}\\n\\nConfidence: ${data.confidence}\\n\\nRelated Tickets:\\n`;
+                    data.related_tickets.forEach(t => html += `- ${t.subject || t.id}: ${t.url}\\n`);
+                    html += `\\nRelated Documentation:\\n`;
+                    data.related_docs.forEach(d => html += `- ${d.title}: ${d.url}\\n`);
+                    html += `\\nRecommended Solution:\\n${data.recommended_solution}`;
+                    resultDiv.innerText = html;
                 } catch (err) {
-                    resultDiv.innerHTML = "<p>Error: " + err + "</p>";
+                    resultDiv.innerText = "Error: " + err;
                 }
             }
         </script>
     </body>
     </html>
     """
+
+@app.get("/health")
+def health():
+    return {"status": "ok"}
