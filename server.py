@@ -2,17 +2,26 @@ import os
 import sys
 import base64
 import httpx
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Response
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from duckduckgo_search import DDGS
+
+# Optional: OpenAI for AI summary
+try:
+    import openai
+    OPENAI_KEY = os.getenv("OPENAI_API_KEY")
+    if OPENAI_KEY:
+        openai.api_key = OPENAI_KEY
+except ImportError:
+    openai = None
+    OPENAI_KEY = None
 
 # ------------------ ENV ------------------
 ZENDESK_SUBDOMAIN = os.getenv("ZENDESK_SUBDOMAIN", "castsoftware")
 
 # ------------------ APP ------------------
 app = FastAPI(title="MCP Web API")
-
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -25,6 +34,10 @@ app.add_middleware(
 async def startup():
     print("[STARTUP] Zendesk Email:", bool(os.getenv("ZENDESK_EMAIL")), file=sys.stderr)
     print("[STARTUP] Zendesk Token:", bool(os.getenv("ZENDESK_API_TOKEN")), file=sys.stderr)
+    if OPENAI_KEY:
+        print("[STARTUP] OpenAI API available for AI summaries", file=sys.stderr)
+    else:
+        print("[STARTUP] OpenAI API key not set, AI summaries disabled", file=sys.stderr)
 
 # ------------------ AUTH ------------------
 def zendesk_headers():
@@ -79,6 +92,20 @@ async def search_tickets(query: str):
         })
     return results
 
+async def ai_summary_fallback(text: str):
+    """Generate a short AI summary if OpenAI key is set"""
+    if not OPENAI_KEY or not openai:
+        return None
+    try:
+        resp = openai.ChatCompletion.create(
+            model="gpt-4",
+            messages=[{"role": "user", "content": f"Summarize this issue with resolution suggestions:\n{text}"}],
+            temperature=0.2,
+        )
+        return resp.choices[0].message.content
+    except Exception as e:
+        return f"AI summary failed: {e}"
+
 # ------------------ TICKET DETAILS ------------------
 @app.post("/ticket/details")
 async def ticket_details(req: TicketRequest):
@@ -97,53 +124,41 @@ async def ticket_details(req: TicketRequest):
     ticket = t.json()["ticket"]
     comments = c.json().get("comments", [])
 
-    # ---------- TEXT AGGREGATION ----------
     history_text = " ".join(c.get("plain_body", "") for c in comments)
     combined_text = f"{ticket['subject']} {ticket.get('description','')} {history_text}"
 
     keywords = extract_keywords(combined_text)
-
-    # ---------- CROSS SEARCH ----------
     related_tickets = await search_tickets(keywords)
     related_docs = search_docs(keywords)
 
-    # ---------- STRUCTURED SUMMARY ----------
+    # Fallback AI summary
+    ai_summary = await ai_summary_fallback(combined_text) or "No AI summary available, fallback applied."
+
+    # Confidence score (simple heuristic)
+    confidence = min(1.0, max(0.1, len(related_tickets)/10 + len(related_docs)/10))
+
+    # Structured summary
     summary = f"""
-Problem:
+Issue Summary:
 {ticket['subject']}
 
 Observed Behavior:
-This issue was discussed across {len(comments)} ticket comments. The problem persists or required clarification across multiple interactions.
+Found {len(comments)} comments describing the problem.
 
 Similar Issues:
-{len(related_tickets)} related tickets were found. This suggests the issue may be recurring or previously investigated.
+{len(related_tickets)} related tickets found.
 
-Documentation Insight:
-{len(related_docs)} relevant documentation references were identified.
+Documentation Insights:
+{len(related_docs)} relevant docs found.
 
 Suggested Resolution:
+{ai_summary}
+
+Confidence Score: {confidence:.2f}
 """
 
-    if related_tickets:
-        summary += (
-            "- Review similar resolved tickets for confirmed workarounds or fixes.\n"
-            "- Validate whether the resolution applies to the current product version.\n"
-        )
-    elif related_docs:
-        summary += (
-            "- Follow configuration or compatibility guidance from CAST documentation.\n"
-            "- Verify product version alignment.\n"
-        )
-    else:
-        summary += (
-            "- No direct match found.\n"
-            "- Collect logs, reproduction steps, and escalate to R&D.\n"
-        )
-
-    # ---------- HTML ----------
     history_html = "".join(
-        f"<p><b>User {c['author_id']}:</b><br>{c.get('plain_body','')}</p>"
-        for c in comments
+        f"<p><b>User {c['author_id']}:</b><br>{c.get('plain_body','')}</p>" for c in comments
     )
 
     html = f"""
@@ -162,6 +177,7 @@ Suggested Resolution:
 
     return {
         "summary": summary.strip(),
+        "confidence": confidence,
         "related_tickets": related_tickets,
         "related_docs": related_docs,
         "html": html,
@@ -173,17 +189,41 @@ async def search_all(req: QueryRequest):
     tickets = await search_tickets(req.query)
     docs = search_docs(req.query)
 
-    summary = (
-        f"Searched tickets (including comments) and documentation.\n"
-        f"Tickets found: {len(tickets)}\n"
-        f"Docs found: {len(docs)}\n"
-    )
-
+    summary = f"Searched tickets and docs for: {req.query}\nTickets: {len(tickets)}, Docs: {len(docs)}"
     return {
         "query": req.query,
         "summary": summary,
         "tickets": tickets,
         "docs": docs,
+    }
+
+# ------------------ PDF EXPORT ------------------
+@app.post("/ticket/html-to-pdf")
+async def html_to_pdf(req: dict):
+    """Return PDF bytes from HTML content"""
+    from weasyprint import HTML
+    html_content = req.get("html")
+    if not html_content:
+        raise HTTPException(400, "Missing HTML content")
+
+    pdf_bytes = HTML(string=html_content).write_pdf()
+    return Response(content=pdf_bytes, media_type="application/pdf")
+
+# ------------------ DEBUG ------------------
+@app.get("/debug/env")
+def debug_env():
+    return {
+        "email": bool(os.getenv("ZENDESK_EMAIL")),
+        "token": bool(os.getenv("ZENDESK_API_TOKEN")),
+        "subdomain": ZENDESK_SUBDOMAIN,
+    }
+
+@app.get("/debug/zendesk")
+def debug_zendesk():
+    return {
+        "email": os.getenv("ZENDESK_EMAIL"),
+        "token": os.getenv("ZENDESK_API_TOKEN"),
+        "subdomain": ZENDESK_SUBDOMAIN
     }
 
 # ------------------ HEALTH ------------------
