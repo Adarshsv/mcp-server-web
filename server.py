@@ -18,18 +18,17 @@ app.add_middleware(
 )
 
 ZENDESK_SUBDOMAIN = os.getenv("ZENDESK_SUBDOMAIN", "castsoftware")
-API_KEY = os.getenv("API_KEY")  # optional (DEV friendly)
+API_KEY = os.getenv("API_KEY")                # optional
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")  # optional
 
 # ------------------ STARTUP LOG ------------------
 @app.on_event("startup")
 async def startup():
-    email = os.getenv("ZENDESK_EMAIL")
-    token = os.getenv("ZENDESK_API_TOKEN")
-
-    print(f"[STARTUP] Zendesk Email Loaded: {bool(email)}", file=sys.stderr)
-    print(f"[STARTUP] Zendesk API Token Loaded: {bool(token)}", file=sys.stderr)
-    print(f"[STARTUP] Zendesk Subdomain: {ZENDESK_SUBDOMAIN}", file=sys.stderr)
+    print(f"[STARTUP] Zendesk Email Loaded: {bool(os.getenv('ZENDESK_EMAIL'))}", file=sys.stderr)
+    print(f"[STARTUP] Zendesk API Token Loaded: {bool(os.getenv('ZENDESK_API_TOKEN'))}", file=sys.stderr)
+    print(f"[STARTUP] Subdomain: {ZENDESK_SUBDOMAIN}", file=sys.stderr)
     print(f"[STARTUP] API_KEY enabled: {bool(API_KEY)}", file=sys.stderr)
+    print(f"[STARTUP] AI enabled: {bool(OPENAI_API_KEY)}", file=sys.stderr)
 
 # ------------------ API KEY (OPTIONAL) ------------------
 @app.middleware("http")
@@ -51,7 +50,7 @@ def zendesk_headers():
     token = os.getenv("ZENDESK_API_TOKEN")
 
     if not email or not token:
-        raise HTTPException(status_code=500, detail="Zendesk credentials not set in environment")
+        raise HTTPException(status_code=500, detail="Zendesk credentials not set")
 
     auth = f"{email}/token:{token}"
     encoded = base64.b64encode(auth.encode()).decode()
@@ -62,18 +61,39 @@ def zendesk_headers():
         "User-Agent": "MCP-Web"
     }
 
-def claude_style_summary(ticket, comments):
-    points = []
-    if ticket.get("status"):
-        points.append(f"• Status: {ticket['status']}")
-    if ticket.get("priority"):
-        points.append(f"• Priority: {ticket['priority']}")
-    if ticket.get("assignee_id"):
-        points.append("• Assigned to support engineer")
-    if comments:
-        points.append(f"• {len(comments)} discussion updates")
+async def ai_summarize(prompt: str):
+    if not OPENAI_API_KEY:
+        return None
 
-    return "\n".join(points)
+    headers = {
+        "Authorization": f"Bearer {OPENAI_API_KEY}",
+        "Content-Type": "application/json",
+    }
+
+    payload = {
+        "model": "gpt-4o-mini",
+        "messages": [
+            {"role": "system", "content": "You are a senior support engineer summarizing Zendesk tickets."},
+            {"role": "user", "content": prompt}
+        ],
+        "temperature": 0.3
+    }
+
+    async with httpx.AsyncClient(timeout=30) as client:
+        resp = await client.post(
+            "https://api.openai.com/v1/chat/completions",
+            headers=headers,
+            json=payload
+        )
+
+    return resp.json()["choices"][0]["message"]["content"]
+
+def fallback_summary(ticket, comments):
+    return "\n".join([
+        f"• Status: {ticket.get('status')}",
+        f"• Priority: {ticket.get('priority')}",
+        f"• Total comments: {len(comments)}"
+    ])
 
 def ticket_html(ticket, comments):
     html = f"""
@@ -125,26 +145,17 @@ def debug_zendesk():
 @app.post("/search/docs")
 async def search_docs(req: QueryRequest):
     with DDGS() as ddgs:
-        results = ddgs.text(
-            f"site:doc.castsoftware.com {req.query}",
-            max_results=5
-        )
+        results = ddgs.text(f"site:doc.castsoftware.com {req.query}", max_results=5)
 
-    if not results:
-        return {"count": 0, "results": []}
-
-    docs = [
-        {
-            "title": r["title"],
-            "link": r["href"],
-            "snippet": r["body"]
-        }
-        for r in results
-    ]
+    docs = [{
+        "title": r["title"],
+        "link": r["href"],
+        "snippet": r["body"]
+    } for r in results] if results else []
 
     return {"count": len(docs), "results": docs}
 
-# ------------------ SEARCH TICKETS (INCL HISTORY) ------------------
+# ------------------ SEARCH TICKETS (HISTORY INCLUDED) ------------------
 @app.post("/search/tickets")
 async def search_tickets(req: QueryRequest):
     headers = zendesk_headers()
@@ -158,14 +169,11 @@ async def search_tickets(req: QueryRequest):
         )
 
     results = resp.json().get("results", [])
-    tickets = [
-        {
-            "id": t["id"],
-            "subject": t["subject"],
-            "status": t["status"]
-        }
-        for t in results[:5]
-    ]
+    tickets = [{
+        "id": t["id"],
+        "subject": t["subject"],
+        "status": t["status"]
+    } for t in results[:5]]
 
     return {"count": len(results), "results": tickets}
 
@@ -175,8 +183,22 @@ async def search_all(req: QueryRequest):
     tickets = await search_tickets(req)
     docs = await search_docs(req)
 
+    prompt = f"""
+User searched for: "{req.query}"
+
+Tickets:
+{tickets}
+
+Docs:
+{docs}
+
+Summarize findings and suggest next steps.
+"""
+    ai_summary = await ai_summarize(prompt)
+
     return {
         "query": req.query,
+        "ai_summary": ai_summary,
         "tickets": tickets,
         "docs": docs
     }
@@ -199,8 +221,25 @@ async def ticket_details(req: TicketRequest):
     ticket = t.json()["ticket"]
     comments = c.json().get("comments", [])
 
+    history_text = "\n".join(c.get("plain_body","") for c in comments)
+
+    prompt = f"""
+Summarize this Zendesk ticket:
+
+Subject: {ticket['subject']}
+Status: {ticket['status']}
+
+Description:
+{ticket['description']}
+
+Conversation:
+{history_text}
+"""
+    ai_summary = await ai_summarize(prompt)
+
     return {
-        "summary": claude_style_summary(ticket, comments),
+        "ai_summary": ai_summary,
+        "fallback_summary": fallback_summary(ticket, comments),
         "html": ticket_html(ticket, comments),
         "raw": ticket
     }
@@ -212,4 +251,4 @@ def health():
 
 @app.get("/version")
 def version():
-    return {"version": "1.0.0"}
+    return {"version": "2.0.0"}
