@@ -1,140 +1,199 @@
 import os
-import re
-from fastapi import FastAPI
+import sys
+import base64
+import httpx
+import asyncio
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from typing import List, Dict
+from duckduckgo_search import DDGS
+import re
 
-# ----------------- CONFIG -----------------
-USE_OPENAI = False  # Set True to use OpenAI for improved summaries
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+# ------------------ ENV SETUP ------------------
+ZENDESK_SUBDOMAIN = os.getenv("ZENDESK_SUBDOMAIN", "castsoftware")
 
-app = FastAPI()
+# ----------------- APP DEFINITION -----------------
+app = FastAPI(title="MCP Web API")
 
-# ----------------- MODELS -----------------
+# -------- CORS --------
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# -------- STARTUP LOGGING --------
+@app.on_event("startup")
+async def startup_event():
+    email_loaded = bool(os.getenv("ZENDESK_EMAIL"))
+    token_loaded = bool(os.getenv("ZENDESK_API_TOKEN"))
+    subdomain = ZENDESK_SUBDOMAIN
+
+    token_display = "****" + os.getenv("ZENDESK_API_TOKEN", "")[-4:] if token_loaded else None
+    email_display = os.getenv("ZENDESK_EMAIL", "None") if email_loaded else "None"
+
+    print(f"[STARTUP] Zendesk Email Loaded: {email_loaded} ({email_display})", file=sys.stderr)
+    print(f"[STARTUP] Zendesk API Token Loaded: {token_loaded} ({token_display})", file=sys.stderr)
+    print(f"[STARTUP] Zendesk Subdomain: {subdomain}", file=sys.stderr)
+
+# -------- Helper: Zendesk Auth Header ----------
+def zendesk_headers():
+    email = os.getenv("ZENDESK_EMAIL")
+    token = os.getenv("ZENDESK_API_TOKEN")
+
+    if not email or not token:
+        raise HTTPException(status_code=500, detail="Zendesk credentials not set in environment")
+
+    auth_str = f"{email}/token:{token}"
+    encoded = base64.b64encode(auth_str.encode()).decode()
+
+    return {
+        "Authorization": f"Basic {encoded}",
+        "Content-Type": "application/json",
+        "User-Agent": "MCP-Web"
+    }
+
+# -------- Request Models --------
+class QueryRequest(BaseModel):
+    query: str
+
 class TicketRequest(BaseModel):
     ticket_id: int
 
-class SearchRequest(BaseModel):
-    query: str
-
-# ----------------- HELPER FUNCTIONS -----------------
-def summarize_semantic(comments: List[Dict]) -> str:
-    """
-    Summarize ticket/comments in 5-6 meaningful sentences.
-    """
+# -------- Helper: Summarize Comments ----------
+def summarize_comments(comments, max_sentences=3):
     if not comments:
-        return "No ticket comments found."
-    
-    # Combine first 5 comments
-    text = " ".join([c.get("plain_body") or c.get("body", "") for c in comments[:5]])
-    
-    # Remove HTML, extra spaces
-    text = re.sub(r"<.*?>", " ", text)
-    text = re.sub(r"&[a-z]+;", " ", text)
-    text = re.sub(r"\s+", " ", text).strip()
-    
-    # Split into sentences
-    sentences = re.split(r'(?<=[.!?]) +', text)
-    
-    # Pick sentences containing keywords
-    keywords = ["error", "issue", "fail", "supported", "steps", "solution", "analysis"]
-    important = [s for s in sentences if any(k.lower() in s.lower() for k in keywords)]
-    
-    # If not enough important sentences, take first few sentences
-    if len(important) < 5:
-        important = sentences[:5]
-    
-    # Limit to max 6 sentences
-    summary = " ".join(important[:6])
-    return summary
+        return ""
+    # Collect top 5 comments
+    snippets = []
+    for c in comments[:5]:
+        body = c.get("plain_body") or c.get("body", "")
+        if body:
+            snippets.append(body.strip().replace("\n", " "))
+    combined = " ".join(snippets)
 
-def generate_summary(ticket_data: Dict) -> Dict:
-    """
-    Generate the concise summary response for a ticket.
-    """
-    comments = ticket_data.get("comments", [])
-    
-    summary_text = summarize_semantic(comments)
-    
-    # Related tickets and docs as links only
-    related_tickets = [
-        {"id": t.get("id"), "subject": t.get("subject"), "url": t.get("url")}
-        for t in ticket_data.get("related_tickets", [])
-    ]
-    
-    related_docs = [
-        {"title": d.get("title"), "url": d.get("url")}
-        for d in ticket_data.get("related_docs", [])
-    ]
-    
-    # Suggested solution (from AI or default fallback)
-    recommended_solution = ticket_data.get("recommended_solution") or \
-        "Based on similar tickets and documentation, apply recommended updates, workarounds, or adjust configuration as per CAST guidelines."
-    
+    # Split into sentences
+    sentences = re.split(r'(?<=[.!?]) +', combined)
+    # Take first few sentences for a concise summary
+    return " ".join(sentences[:max_sentences])
+
+# -------- Shared Helper: Build Summary --------
+async def generate_summary(query=None, ticket_ids=None):
+    related_tickets = []
+    related_docs = []
+    summarized_comments = ""
+
+    async with httpx.AsyncClient(timeout=30) as client:
+        headers = zendesk_headers()
+
+        # -------- Fetch Related Tickets --------
+        if ticket_ids:
+            ticket_promises = []
+            for tid in ticket_ids:
+                ticket_promises.append(client.get(
+                    f"https://{ZENDESK_SUBDOMAIN}.zendesk.com/api/v2/tickets/{tid}/comments.json",
+                    headers=headers
+                ))
+                related_tickets.append({
+                    "id": tid,
+                    "url": f"https://{ZENDESK_SUBDOMAIN}.zendesk.com/agent/tickets/{tid}"
+                })
+            comments_responses = await asyncio.gather(*ticket_promises)
+            for c_resp in comments_responses:
+                comments = c_resp.json().get("comments", [])
+                summarized_comments += summarize_comments(comments) + " "
+        elif query:
+            # Search by keyword
+            try:
+                resp = await client.get(
+                    f"https://{ZENDESK_SUBDOMAIN}.zendesk.com/api/v2/search.json",
+                    headers=headers,
+                    params={"query": f"type:ticket {query}"}
+                )
+                resp.raise_for_status()
+                tickets = resp.json().get("results", [])
+                for t in tickets[:5]:
+                    related_tickets.append({
+                        "id": t["id"],
+                        "subject": t["subject"],
+                        "url": f"https://{ZENDESK_SUBDOMAIN}.zendesk.com/agent/tickets/{t['id']}"
+                    })
+                # summarize comments
+                comments_responses = await asyncio.gather(*[
+                    client.get(
+                        f"https://{ZENDESK_SUBDOMAIN}.zendesk.com/api/v2/tickets/{t['id']}/comments.json",
+                        headers=headers
+                    ) for t in tickets[:5]
+                ])
+                for c_resp in comments_responses:
+                    comments = c_resp.json().get("comments", [])
+                    summarized_comments += summarize_comments(comments) + " "
+            except Exception:
+                pass
+
+        # -------- Fetch Related Docs --------
+        if query:
+            try:
+                with DDGS() as ddgs:
+                    docs = ddgs.text(f"site:doc.castsoftware.com {query}", max_results=3)
+                    for d in docs:
+                        related_docs.append({"title": d["title"], "url": d["href"]})
+            except Exception:
+                pass
+
+        # -------- Generate Recommended Solution --------
+        if related_tickets or related_docs:
+            recommended_solution = (
+                "Based on similar tickets and documentation, "
+                "apply recommended updates, known workarounds, "
+                "or adjust configuration as per CAST guidelines."
+            )
+        else:
+            recommended_solution = (
+                "No direct reference found. Investigate ticket comments "
+                "and CAST documentation for potential solution."
+            )
+
+        # -------- Build Concise Summary Text (4-5 sentences) --------
+        summary_lines = []
+
+        if query:
+            summary_lines.append(f"Search Query: {query}")
+        if summarized_comments:
+            summary_lines.append(f"Observed Behavior: {summarized_comments.strip()}")
+        summary_lines.append(f"Similar Issues: {len(related_tickets)} related tickets found.")
+        summary_lines.append(f"Documentation References: {len(related_docs)} docs found.")
+        summary_lines.append(f"Suggested Resolution: {recommended_solution}")
+
+        summary_text = " ".join(summary_lines)  # single concise paragraph
+        confidence = round(min(0.3 + len(related_tickets) * 0.15, 0.9), 2)
+
+        return {
+            "summary": summary_text,
+            "confidence": confidence,
+            "related_tickets": related_tickets,
+            "related_docs": related_docs,
+            "recommended_solution": recommended_solution
+        }
+
+# -------- ROUTES --------
+@app.get("/debug/env")
+def debug_env():
     return {
-        "summary": summary_text,
-        "confidence": ticket_data.get("confidence", 0.5),
-        "related_tickets": related_tickets,
-        "related_docs": related_docs,
-        "recommended_solution": recommended_solution
+        "email": bool(os.getenv("ZENDESK_EMAIL")),
+        "token": bool(os.getenv("ZENDESK_API_TOKEN")),
+        "subdomain": ZENDESK_SUBDOMAIN,
     }
 
-# ----------------- ROUTES -----------------
 @app.post("/ticket/details")
-def ticket_details(request: TicketRequest):
-    """
-    Fetch ticket info and return concise semantic summary with links and solution.
-    """
-    # Fetch ticket from DB/Service
-    # This is placeholder; replace with real data fetch
-    ticket_data = fetch_ticket_data(request.ticket_id)
-    
-    return generate_summary(ticket_data)
+async def ticket_details(req: TicketRequest):
+    return await generate_summary(ticket_ids=[req.ticket_id])
 
 @app.post("/search/all")
-def search_all(request: SearchRequest):
-    """
-    Search tickets/docs by keyword and return concise summaries.
-    """
-    # Fetch search results from DB/Service
-    search_results = fetch_search_results(request.query)
-    
-    summarized_results = []
-    for ticket in search_results.get("tickets", []):
-        summarized_results.append(generate_summary(ticket))
-    
-    return {
-        "query": request.query,
-        "summary": f"Search Query: {request.query}. {len(search_results.get('tickets', []))} tickets found.",
-        "results": summarized_results
-    }
+async def search_all(req: QueryRequest):
+    return await generate_summary(query=req.query)
 
-# ----------------- PLACEHOLDER FUNCTIONS -----------------
-def fetch_ticket_data(ticket_id: int) -> Dict:
-    """
-    Replace this with your real ticket fetching logic.
-    """
-    # Example structure
-    return {
-        "comments": [
-            {"plain_body": "The VC++ project fails because paths could not be substituted. Install correct Visual Studio IDE."},
-            {"plain_body": "Ensure IDE version matches VC++ project files to avoid registry errors."},
-        ],
-        "related_tickets": [
-            {"id": 23930, "subject": "Is VC++ and VC supported by CAST?", "url": "https://castsoftware.zendesk.com/agent/tickets/23930"},
-            {"id": 2208, "subject": "XXL table size info not visible on CAST result", "url": "https://castsoftware.zendesk.com/agent/tickets/2208"},
-        ],
-        "related_docs": [
-            {"title": "CMS Snapshot Analyzer Fatal Error", "url": "https://doc.castsoftware.com/display/TKBQG/CMS+Snapshot+Analysis+-+Run+Analyzer+-+Fatal+Error+-+CPP+with+Core+CAST+AIP+-+Some+paths+could+not+be+substituted"}
-        ],
-        "recommended_solution": "Install correct IDE, match VC++ version, follow CAST troubleshooting guide.",
-        "confidence": 0.9
-    }
-
-def fetch_search_results(query: str) -> Dict:
-    """
-    Replace this with real search logic.
-    """
-    return {
-        "tickets": [fetch_ticket_data(12345), fetch_ticket_data(12346)]
-    }
+@app.get("/")
+def health():
+    return {"status": "ok"}
