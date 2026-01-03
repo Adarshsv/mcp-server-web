@@ -1,0 +1,43 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>Ticket Analyzer</title>
+  <style>
+    body { font-family: Arial; margin: 40px; }
+    input, button { padding: 8px; }
+    pre { background: #f4f4f4; padding: 15px; }
+  </style>
+</head>
+<body>
+
+<h2>CAST Ticket Analyzer</h2>
+
+<input id="input" placeholder="Ticket ID or search text" size="40">
+<button onclick="search()">Analyze</button>
+
+<pre id="result"></pre>
+
+<script>
+async function search() {
+  const value = document.getElementById("input").value.trim();
+  const payload = isNaN(value)
+    ? { query: value }
+    : { ticket_id: Number(value) };
+
+  const url = isNaN(value)
+    ? "/search/all"
+    : "/ticket/details";
+
+  const res = await fetch(url, {
+    method: "POST",
+    headers: {"Content-Type":"application/json"},
+    body: JSON.stringify(payload)
+  });
+
+  document.getElementById("result").textContent =
+    JSON.stringify(await res.json(), null, 2);
+}
+</script>
+
+</body>
+</html>
