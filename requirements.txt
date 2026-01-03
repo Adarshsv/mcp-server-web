@@ -4,3 +4,4 @@ httpx
 python-dotenv
 duckduckgo-search
 reportlab
+openai>=1.0.0

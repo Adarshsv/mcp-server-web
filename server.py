@@ -10,11 +10,19 @@ from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 from duckduckgo_search import DDGS
 
-# ------------------ ENV SETUP ------------------
-ZENDESK_SUBDOMAIN = os.getenv("ZENDESK_SUBDOMAIN", "castsoftware")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+# ---------- OPTIONAL OPENAI ----------
+openai_client = None
+if os.getenv("OPENAI_API_KEY"):
+    try:
+        from openai import OpenAI
+        openai_client = OpenAI()
+    except Exception as e:
+        print("[WARN] OpenAI not initialized:", e, file=sys.stderr)
 
-# ----------------- APP DEFINITION -----------------
+# ------------------ ENV ------------------
+ZENDESK_SUBDOMAIN = os.getenv("ZENDESK_SUBDOMAIN", "castsoftware")
+
+# ------------------ APP ------------------
 app = FastAPI(title="MCP Web API")
 
 app.add_middleware(
@@ -24,158 +32,231 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# -------- STARTUP LOGGING --------
+# ------------------ STARTUP ------------------
 @app.on_event("startup")
 async def startup_event():
-    print("[STARTUP] Zendesk Email:", bool(os.getenv("ZENDESK_EMAIL")), file=sys.stderr)
-    print("[STARTUP] Zendesk Token:", bool(os.getenv("ZENDESK_API_TOKEN")), file=sys.stderr)
-    print("[STARTUP] OpenAI Enabled:", bool(OPENAI_API_KEY), file=sys.stderr)
+    print("[STARTUP] MCP Web API running", file=sys.stderr)
 
-# -------- Zendesk Auth --------
+# ------------------ AUTH ------------------
 def zendesk_headers():
     email = os.getenv("ZENDESK_EMAIL")
     token = os.getenv("ZENDESK_API_TOKEN")
     if not email or not token:
-        raise HTTPException(status_code=500, detail="Zendesk credentials missing")
+        raise HTTPException(500, "Zendesk credentials missing")
+
     auth = base64.b64encode(f"{email}/token:{token}".encode()).decode()
-    return {"Authorization": f"Basic {auth}", "Content-Type": "application/json"}
+    return {
+        "Authorization": f"Basic {auth}",
+        "Content-Type": "application/json",
+        "User-Agent": "MCP-Web"
+    }
 
-# -------- Models --------
-class QueryRequest(BaseModel):
-    query: str
-
+# ------------------ MODELS ------------------
 class TicketRequest(BaseModel):
     ticket_id: int
 
-# -------- Text Helpers --------
-def summarize_comments(comments):
-    text = " ".join(
-        (c.get("plain_body") or c.get("body") or "").replace("\n", " ")
-        for c in comments[:8]
-    )
-    sentences = re.split(r"\. ", text)
-    return ". ".join(sentences[:5]) + "."
+class QueryRequest(BaseModel):
+    query: str
 
-def highlight(text, keywords):
-    for k in keywords:
-        text = re.sub(re.escape(k), f"<mark>{k}</mark>", text, flags=re.I)
-    return text
+# ------------------ HELPERS ------------------
+def clean_text(text: str) -> str:
+    text = re.sub(r"<[^>]+>", "", text)
+    text = re.sub(r"\s+", " ", text)
+    return text.strip()
 
-# -------- OpenAI Summarizer (Optional) --------
+def extract_comments(comments):
+    collected = []
+    for c in comments:
+        body = c.get("plain_body") or c.get("body") or ""
+        body = clean_text(body)
+        if body:
+            collected.append(body)
+    return " ".join(collected)
+
+def shorten(text, max_sentences=4):
+    parts = re.split(r"\. |\n", text)
+    return ". ".join(parts[:max_sentences]).strip()
+
+# ------------------ OPENAI SUMMARY ------------------
 async def ai_summary(text):
-    if not OPENAI_API_KEY or not text.strip():
+    if not openai_client or not text:
         return None
+    try:
+        response = await asyncio.to_thread(
+            openai_client.responses.create,
+            model="gpt-4.1-mini",
+            input=f"""
+Summarize the following CAST support ticket issue clearly
+and suggest a likely fix.
+
+{text}
+"""
+        )
+        return response.output_text.strip()
+    except Exception as e:
+        print("[OpenAI ERROR]", e, file=sys.stderr)
+        return None
+
+# ------------------ DOC SEARCH ------------------
+def fetch_docs(query):
+    docs = []
+    if not query:
+        return docs
 
     try:
-        async with httpx.AsyncClient(timeout=20) as client:
-            resp = await client.post(
-                "https://api.openai.com/v1/chat/completions",
-                headers={
-                    "Authorization": f"Bearer {OPENAI_API_KEY}",
-                    "Content-Type": "application/json",
-                },
-                json={
-                    "model": "gpt-4o-mini",
-                    "messages": [
-                        {"role": "system", "content": "Summarize the issue clearly in 4 sentences."},
-                        {"role": "user", "content": text}
-                    ],
-                    "temperature": 0.2
-                },
+        with DDGS() as ddgs:
+            results = ddgs.text(
+                f"CAST AIP analyzer {query} error",
+                max_results=5
             )
-            return resp.json()["choices"][0]["message"]["content"]
+            for r in results:
+                docs.append({
+                    "title": r.get("title"),
+                    "url": r.get("href")
+                })
     except Exception:
-        return None
+        pass
 
-# -------- Core Logic --------
-async def generate_summary(query=None, ticket_ids=None):
-    related_tickets, related_docs = [], []
-    comment_text = ""
+    return docs
 
-    async with httpx.AsyncClient(timeout=30) as client:
+# ------------------ CORE LOGIC ------------------
+async def generate_summary(ticket_id=None, query=None):
+    related_tickets = []
+    related_docs = []
+    raw_text = ""
+
+    async with httpx.AsyncClient(timeout=25) as client:
         headers = zendesk_headers()
 
-        # --- Ticket Fetch ---
-        if ticket_ids:
-            for tid in ticket_ids:
-                c = await client.get(
-                    f"https://{ZENDESK_SUBDOMAIN}.zendesk.com/api/v2/tickets/{tid}/comments.json",
-                    headers=headers,
-                )
-                comments = c.json().get("comments", [])
-                comment_text += summarize_comments(comments)
-                related_tickets.append({
-                    "id": tid,
-                    "url": f"https://{ZENDESK_SUBDOMAIN}.zendesk.com/agent/tickets/{tid}"
-                })
+        # ----- Ticket-based -----
+        if ticket_id:
+            url = f"https://{ZENDESK_SUBDOMAIN}.zendesk.com/api/v2/tickets/{ticket_id}/comments.json"
+            r = await client.get(url, headers=headers)
+            comments = r.json().get("comments", [])
+            raw_text = extract_comments(comments)
 
-        # --- Keyword Search ---
+            related_tickets.append({
+                "id": ticket_id,
+                "url": f"https://{ZENDESK_SUBDOMAIN}.zendesk.com/agent/tickets/{ticket_id}"
+            })
+
+        # ----- Search-based -----
         if query:
-            r = await client.get(
+            search = await client.get(
                 f"https://{ZENDESK_SUBDOMAIN}.zendesk.com/api/v2/search.json",
                 headers=headers,
                 params={"query": f"type:ticket {query}"}
             )
-            for t in r.json().get("results", [])[:5]:
+            results = search.json().get("results", [])[:5]
+
+            for t in results:
                 related_tickets.append({
                     "id": t["id"],
                     "subject": t["subject"],
                     "url": f"https://{ZENDESK_SUBDOMAIN}.zendesk.com/agent/tickets/{t['id']}"
                 })
 
-        # --- Docs via DuckDuckGo (FIXED) ---
-        if query:
-            with DDGS() as ddgs:
-                for d in ddgs.search(
-                    f"site:doc.castsoftware.com {query}",
-                    max_results=5
-                ):
-                    if d.get("href"):
-                        related_docs.append({
-                            "title": d.get("title", "CAST Documentation"),
-                            "url": d["href"]
-                        })
-                related_docs = related_docs[:3]
+        # ----- DOCS -----
+        related_docs = fetch_docs(query or "")
 
-    # --- AI Summary (if enabled) ---
-    ai_result = await ai_summary(comment_text)
-
-    observed = ai_result or comment_text or "No significant ticket history found."
-
-    # --- Dynamic Recommendation ---
-    recommendation = (
-        "Review related tickets and apply known fixes."
-        if related_tickets else
-        "Check CAST documentation and validate configuration."
+    # ----- SUMMARY -----
+    ai_text = await ai_summary(raw_text)
+    observed = (
+        ai_text
+        or shorten(raw_text)
+        or "Issue reported but detailed behavior not captured in comments."
     )
 
-    if related_docs:
-        recommendation += " Refer to linked CAST documentation."
+    # ----- RECOMMENDATION -----
+    if ai_text:
+        recommendation = "Apply the configuration or product fix suggested above."
+    elif related_docs:
+        recommendation = "Follow the linked CAST documentation for the recommended workaround."
+    elif related_tickets:
+        recommendation = "Apply the solution used in similar resolved tickets."
+    else:
+        recommendation = "Collect logs and escalate for deeper investigation."
 
-    confidence = round(min(0.4 + len(related_tickets) * 0.1 + len(related_docs) * 0.1, 0.95), 2)
+    confidence = round(min(0.4 + len(related_tickets) * 0.15, 0.9), 2)
 
     return {
-        "summary": f"Observed Behavior: {observed}",
+        "summary": f"Observed Behavior:\n{observed}",
         "confidence": confidence,
         "related_tickets": related_tickets,
         "related_docs": related_docs,
         "recommended_solution": recommendation
     }
 
-# -------- API Routes --------
+# ------------------ API ------------------
 @app.post("/ticket/details")
 async def ticket_details(req: TicketRequest):
-    return await generate_summary(ticket_ids=[req.ticket_id])
+    return await generate_summary(ticket_id=req.ticket_id)
 
 @app.post("/search/all")
 async def search_all(req: QueryRequest):
     return await generate_summary(query=req.query)
 
-# -------- UI --------
+# ------------------ UI ------------------
 @app.get("/", response_class=HTMLResponse)
 def home():
-    return open("ui.html").read() if os.path.exists("ui.html") else "<h2>UI missing</h2>"
+    return """
+<!DOCTYPE html>
+<html>
+<head>
+<title>CAST Support Dashboard</title>
+<style>
+body { font-family: Arial; background:#f4f4f4; padding:20px; max-width:1000px; margin:auto; }
+.card { background:#fff; padding:15px; margin-top:15px; border-radius:8px; }
+button { padding:10px; background:#007bff; color:white; border:none; }
+input { padding:10px; width:100%; max-width:400px; }
+</style>
+</head>
+<body>
+<h1>CAST Ticket Analyzer</h1>
 
-@app.get("/health")
-def health():
-    return {"status": "ok"}
+<input id="ticket_id" type="number" placeholder="Ticket ID"><br><br>
+<input id="query" placeholder="Search keywords"><br><br>
+<button onclick="go()">Analyze</button>
+
+<div id="result"></div>
+
+<script>
+async function go() {
+  let ticket = document.getElementById("ticket_id").value;
+  let query = document.getElementById("query").value;
+  let url = ticket ? "/ticket/details" : "/search/all";
+  let body = ticket ? {ticket_id:parseInt(ticket)} : {query};
+
+  document.getElementById("result").innerHTML="Loading...";
+
+  let r = await fetch(url,{
+    method:"POST",
+    headers:{"Content-Type":"application/json"},
+    body:JSON.stringify(body)
+  });
+
+  let d = await r.json();
+
+  let html = `<div class="card"><pre>${d.summary}</pre></div>`;
+  html += `<div class="card"><b>Confidence:</b> ${d.confidence}</div>`;
+
+  html += `<div class="card"><b>Related Tickets</b><br>`;
+  (d.related_tickets||[]).forEach(t=>{
+    html+=`<a target=_blank href="${t.url}">${t.subject||t.id}</a><br>`;
+  });
+  html += `</div>`;
+
+  html += `<div class="card"><b>Documentation</b><br>`;
+  (d.related_docs||[]).forEach(x=>{
+    html+=`<a target=_blank href="${x.url}">${x.title}</a><br>`;
+  });
+  html += `</div>`;
+
+  html += `<div class="card"><b>Recommended Solution</b><br>${d.recommended_solution}</div>`;
+
+  document.getElementById("result").innerHTML=html;
+}
+</script>
+</body>
+</html>
+"""
