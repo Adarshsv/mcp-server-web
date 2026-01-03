@@ -1,29 +1,13 @@
 import os
-import sys
-import base64
-import httpx
-import asyncio
 import re
-from fastapi import FastAPI, HTTPException
+import httpx
+from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
-from duckduckgo_search import DDGS
+from openai import OpenAI
 
-# ---------- OPTIONAL OPENAI ----------
-openai_client = None
-if os.getenv("OPENAI_API_KEY"):
-    try:
-        from openai import OpenAI
-        openai_client = OpenAI()
-    except Exception as e:
-        print("[WARN] OpenAI not initialized:", e, file=sys.stderr)
-
-# ------------------ ENV ------------------
-ZENDESK_SUBDOMAIN = os.getenv("ZENDESK_SUBDOMAIN", "castsoftware")
-
-# ------------------ APP ------------------
-app = FastAPI(title="MCP Web API")
+# ------------------ APP SETUP ------------------
+app = FastAPI()
 
 app.add_middleware(
     CORSMiddleware,
@@ -32,231 +16,133 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ------------------ STARTUP ------------------
-@app.on_event("startup")
-async def startup_event():
-    print("[STARTUP] MCP Web API running", file=sys.stderr)
+client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
-# ------------------ AUTH ------------------
-def zendesk_headers():
-    email = os.getenv("ZENDESK_EMAIL")
-    token = os.getenv("ZENDESK_API_TOKEN")
-    if not email or not token:
-        raise HTTPException(500, "Zendesk credentials missing")
-
-    auth = base64.b64encode(f"{email}/token:{token}".encode()).decode()
-    return {
-        "Authorization": f"Basic {auth}",
-        "Content-Type": "application/json",
-        "User-Agent": "MCP-Web"
-    }
+ZENDESK_COOKIE = os.getenv("ZENDESK_COOKIE")
 
 # ------------------ MODELS ------------------
 class TicketRequest(BaseModel):
     ticket_id: int
 
-class QueryRequest(BaseModel):
-    query: str
 
-# ------------------ HELPERS ------------------
-def clean_text(text: str) -> str:
-    text = re.sub(r"<[^>]+>", "", text)
-    text = re.sub(r"\s+", " ", text)
-    return text.strip()
+# ------------------ TEXT CLEANING ------------------
+def clean_comment(text: str) -> str:
+    if not text:
+        return ""
 
-def extract_comments(comments):
-    collected = []
+    # Remove CID images
+    text = re.sub(r'\[cid:.*?\]', '', text)
+
+    # Remove URLs
+    text = re.sub(r'http\S+', '', text)
+
+    # Mask long secrets (API keys, tokens)
+    text = re.sub(r'[A-Za-z0-9]{20,}', '[REDACTED]', text)
+
+    # Remove signatures
+    text = re.split(r'\n--\s|\nRegards,|\nThanks,', text, flags=re.I)[0]
+
+    # Normalize whitespace
+    text = re.sub(r'\s+', ' ', text).strip()
+
+    return text
+
+
+# ------------------ COMMENT CLASSIFICATION ------------------
+SOLUTION_KEYWORDS = [
+    "run with admin",
+    "run as administrator",
+    "please run",
+    "resolved by",
+    "solution is",
+    "fix is",
+    "workaround",
+    "recommended",
+    "try running"
+]
+
+def split_issue_solution(comments: list[str]):
+    issue = []
+    solution = []
+
     for c in comments:
-        body = c.get("plain_body") or c.get("body") or ""
-        body = clean_text(body)
-        if body:
-            collected.append(body)
-    return " ".join(collected)
+        lc = c.lower()
+        if any(k in lc for k in SOLUTION_KEYWORDS):
+            solution.append(c)
+        else:
+            issue.append(c)
 
-def shorten(text, max_sentences=4):
-    parts = re.split(r"\. |\n", text)
-    return ". ".join(parts[:max_sentences]).strip()
+    return " ".join(issue), " ".join(solution)
 
-# ------------------ OPENAI SUMMARY ------------------
-async def ai_summary(text):
-    if not openai_client or not text:
-        return None
-    try:
-        response = await asyncio.to_thread(
-            openai_client.responses.create,
-            model="gpt-4.1-mini",
-            input=f"""
-Summarize the following CAST support ticket issue clearly
-and suggest a likely fix.
 
-{text}
+# ------------------ ZENDESK FETCH ------------------
+async def fetch_ticket(ticket_id: int):
+    url = f"https://castsoftware.zendesk.com/api/v2/tickets/{ticket_id}/comments.json"
+    headers = {"Cookie": ZENDESK_COOKIE}
+
+    async with httpx.AsyncClient(timeout=30) as client:
+        r = await client.get(url, headers=headers)
+        r.raise_for_status()
+        return r.json()["comments"]
+
+
+# ------------------ ANALYSIS LOGIC ------------------
+def analyze_ticket(comments: list[str]):
+    cleaned = [clean_comment(c) for c in comments if c.strip()]
+
+    issue_text, solution_text = split_issue_solution(cleaned)
+
+    # If solution exists → trust ticket, not AI
+    if solution_text:
+        return {
+            "summary": f"Observed Behavior:\n{issue_text}\n\nResolution:\n{solution_text}",
+            "confidence": 0.75,
+            "recommended_solution": solution_text
+        }
+
+    # Otherwise → OpenAI fallback
+    prompt = f"""
+You are analyzing a CAST support ticket.
+
+ISSUE:
+{issue_text}
+
+Provide:
+1. Clear issue summary (2 lines)
+2. Recommended resolution
+3. Confidence score between 0 and 1
 """
-        )
-        return response.output_text.strip()
-    except Exception as e:
-        print("[OpenAI ERROR]", e, file=sys.stderr)
-        return None
 
-# ------------------ DOC SEARCH ------------------
-def fetch_docs(query):
-    docs = []
-    if not query:
-        return docs
-
-    try:
-        with DDGS() as ddgs:
-            results = ddgs.text(
-                f"CAST AIP analyzer {query} error",
-                max_results=5
-            )
-            for r in results:
-                docs.append({
-                    "title": r.get("title"),
-                    "url": r.get("href")
-                })
-    except Exception:
-        pass
-
-    return docs
-
-# ------------------ CORE LOGIC ------------------
-async def generate_summary(ticket_id=None, query=None):
-    related_tickets = []
-    related_docs = []
-    raw_text = ""
-
-    async with httpx.AsyncClient(timeout=25) as client:
-        headers = zendesk_headers()
-
-        # ----- Ticket-based -----
-        if ticket_id:
-            url = f"https://{ZENDESK_SUBDOMAIN}.zendesk.com/api/v2/tickets/{ticket_id}/comments.json"
-            r = await client.get(url, headers=headers)
-            comments = r.json().get("comments", [])
-            raw_text = extract_comments(comments)
-
-            related_tickets.append({
-                "id": ticket_id,
-                "url": f"https://{ZENDESK_SUBDOMAIN}.zendesk.com/agent/tickets/{ticket_id}"
-            })
-
-        # ----- Search-based -----
-        if query:
-            search = await client.get(
-                f"https://{ZENDESK_SUBDOMAIN}.zendesk.com/api/v2/search.json",
-                headers=headers,
-                params={"query": f"type:ticket {query}"}
-            )
-            results = search.json().get("results", [])[:5]
-
-            for t in results:
-                related_tickets.append({
-                    "id": t["id"],
-                    "subject": t["subject"],
-                    "url": f"https://{ZENDESK_SUBDOMAIN}.zendesk.com/agent/tickets/{t['id']}"
-                })
-
-        # ----- DOCS -----
-        related_docs = fetch_docs(query or "")
-
-    # ----- SUMMARY -----
-    ai_text = await ai_summary(raw_text)
-    observed = (
-        ai_text
-        or shorten(raw_text)
-        or "Issue reported but detailed behavior not captured in comments."
+    resp = client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0.2
     )
 
-    # ----- RECOMMENDATION -----
-    if ai_text:
-        recommendation = "Apply the configuration or product fix suggested above."
-    elif related_docs:
-        recommendation = "Follow the linked CAST documentation for the recommended workaround."
-    elif related_tickets:
-        recommendation = "Apply the solution used in similar resolved tickets."
-    else:
-        recommendation = "Collect logs and escalate for deeper investigation."
-
-    confidence = round(min(0.4 + len(related_tickets) * 0.15, 0.9), 2)
-
     return {
-        "summary": f"Observed Behavior:\n{observed}",
-        "confidence": confidence,
-        "related_tickets": related_tickets,
-        "related_docs": related_docs,
-        "recommended_solution": recommendation
+        "summary": resp.choices[0].message.content,
+        "confidence": 0.5,
+        "recommended_solution": "Review related tickets or collect more logs."
     }
 
-# ------------------ API ------------------
+
+# ------------------ API ENDPOINT ------------------
 @app.post("/ticket/details")
 async def ticket_details(req: TicketRequest):
-    return await generate_summary(ticket_id=req.ticket_id)
+    comments_raw = await fetch_ticket(req.ticket_id)
+    comments_text = [c.get("body", "") for c in comments_raw]
 
-@app.post("/search/all")
-async def search_all(req: QueryRequest):
-    return await generate_summary(query=req.query)
+    analysis = analyze_ticket(comments_text)
 
-# ------------------ UI ------------------
-@app.get("/", response_class=HTMLResponse)
-def home():
-    return """
-<!DOCTYPE html>
-<html>
-<head>
-<title>CAST Support Dashboard</title>
-<style>
-body { font-family: Arial; background:#f4f4f4; padding:20px; max-width:1000px; margin:auto; }
-.card { background:#fff; padding:15px; margin-top:15px; border-radius:8px; }
-button { padding:10px; background:#007bff; color:white; border:none; }
-input { padding:10px; width:100%; max-width:400px; }
-</style>
-</head>
-<body>
-<h1>CAST Ticket Analyzer</h1>
-
-<input id="ticket_id" type="number" placeholder="Ticket ID"><br><br>
-<input id="query" placeholder="Search keywords"><br><br>
-<button onclick="go()">Analyze</button>
-
-<div id="result"></div>
-
-<script>
-async function go() {
-  let ticket = document.getElementById("ticket_id").value;
-  let query = document.getElementById("query").value;
-  let url = ticket ? "/ticket/details" : "/search/all";
-  let body = ticket ? {ticket_id:parseInt(ticket)} : {query};
-
-  document.getElementById("result").innerHTML="Loading...";
-
-  let r = await fetch(url,{
-    method:"POST",
-    headers:{"Content-Type":"application/json"},
-    body:JSON.stringify(body)
-  });
-
-  let d = await r.json();
-
-  let html = `<div class="card"><pre>${d.summary}</pre></div>`;
-  html += `<div class="card"><b>Confidence:</b> ${d.confidence}</div>`;
-
-  html += `<div class="card"><b>Related Tickets</b><br>`;
-  (d.related_tickets||[]).forEach(t=>{
-    html+=`<a target=_blank href="${t.url}">${t.subject||t.id}</a><br>`;
-  });
-  html += `</div>`;
-
-  html += `<div class="card"><b>Documentation</b><br>`;
-  (d.related_docs||[]).forEach(x=>{
-    html+=`<a target=_blank href="${x.url}">${x.title}</a><br>`;
-  });
-  html += `</div>`;
-
-  html += `<div class="card"><b>Recommended Solution</b><br>${d.recommended_solution}</div>`;
-
-  document.getElementById("result").innerHTML=html;
-}
-</script>
-</body>
-</html>
-"""
+    return {
+        "summary": analysis["summary"],
+        "confidence": analysis["confidence"],
+        "related_tickets": [
+            {
+                "id": req.ticket_id,
+                "url": f"https://castsoftware.zendesk.com/agent/tickets/{req.ticket_id}"
+            }
+        ],
+        "related_docs": {},
+        "recommended_solution": analysis["recommended_solution"]
+    }
