@@ -4,7 +4,6 @@ import httpx
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from openai import OpenAI
 
 # ------------------ APP SETUP ------------------
 app = FastAPI()
@@ -16,8 +15,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-
 ZENDESK_COOKIE = os.getenv("ZENDESK_COOKIE")
 
 # ------------------ MODELS ------------------
@@ -25,58 +22,39 @@ class TicketRequest(BaseModel):
     ticket_id: int
 
 
-# ------------------ TEXT CLEANING ------------------
-def clean_comment(text: str) -> str:
+# ------------------ CLEANING ------------------
+def clean(text: str) -> str:
     if not text:
         return ""
 
-    # Remove CID images
     text = re.sub(r'\[cid:.*?\]', '', text)
-
-    # Remove URLs
     text = re.sub(r'http\S+', '', text)
+    text = re.sub(r'[A-Za-z0-9]{25,}', '[REDACTED]', text)
+    text = re.sub(r'\s+', ' ', text)
 
-    # Mask long secrets (API keys, tokens)
-    text = re.sub(r'[A-Za-z0-9]{20,}', '[REDACTED]', text)
-
-    # Remove signatures
-    text = re.split(r'\n--\s|\nRegards,|\nThanks,', text, flags=re.I)[0]
-
-    # Normalize whitespace
-    text = re.sub(r'\s+', ' ', text).strip()
-
-    return text
+    return text.strip()
 
 
-# ------------------ COMMENT CLASSIFICATION ------------------
-SOLUTION_KEYWORDS = [
-    "run with admin",
-    "run as administrator",
-    "please run",
-    "resolved by",
-    "solution is",
-    "fix is",
-    "workaround",
-    "recommended",
-    "try running"
-]
+# ------------------ EXTRACTION ------------------
+def extract_resolution(text: str) -> str | None:
+    patterns = [
+        r'please run .*?admin',
+        r'run .*?administrator',
+        r'resolved by .*',
+        r'workaround .*',
+        r'solution .*',
+    ]
 
-def split_issue_solution(comments: list[str]):
-    issue = []
-    solution = []
+    for p in patterns:
+        m = re.search(p, text, re.I)
+        if m:
+            return m.group(0).capitalize()
 
-    for c in comments:
-        lc = c.lower()
-        if any(k in lc for k in SOLUTION_KEYWORDS):
-            solution.append(c)
-        else:
-            issue.append(c)
-
-    return " ".join(issue), " ".join(solution)
+    return None
 
 
-# ------------------ ZENDESK FETCH ------------------
-async def fetch_ticket(ticket_id: int):
+# ------------------ ZENDESK ------------------
+async def fetch_comments(ticket_id: int):
     url = f"https://castsoftware.zendesk.com/api/v2/tickets/{ticket_id}/comments.json"
     headers = {"Cookie": ZENDESK_COOKIE}
 
@@ -86,57 +64,162 @@ async def fetch_ticket(ticket_id: int):
         return r.json()["comments"]
 
 
-# ------------------ ANALYSIS LOGIC ------------------
-def analyze_ticket(comments: list[str]):
-    cleaned = [clean_comment(c) for c in comments if c.strip()]
+# ------------------ ANALYSIS ------------------
+def analyze(comments):
+    user_issue = []
+    agent_replies = []
 
-    issue_text, solution_text = split_issue_solution(cleaned)
+    for c in comments:
+        body = clean(c.get("body", ""))
+        if not body:
+            continue
 
-    # If solution exists → trust ticket, not AI
-    if solution_text:
-        return {
-            "summary": f"Observed Behavior:\n{issue_text}\n\nResolution:\n{solution_text}",
-            "confidence": 0.75,
-            "recommended_solution": solution_text
-        }
+        author = c.get("author_id", "")
+        role = c.get("via", {}).get("source", {}).get("from", {}).get("name", "")
 
-    # Otherwise → OpenAI fallback
-    prompt = f"""
-You are analyzing a CAST support ticket.
+        # Heuristic: agent replies usually shorter and directive
+        if "please" in body.lower() or "run" in body.lower():
+            agent_replies.append(body)
+        else:
+            user_issue.append(body)
 
-ISSUE:
-{issue_text}
+    issue_text = " ".join(user_issue[:2])
 
-Provide:
-1. Clear issue summary (2 lines)
-2. Recommended resolution
-3. Confidence score between 0 and 1
-"""
+    # 🔥 Look for solution in LAST agent reply
+    for reply in reversed(agent_replies):
+        resolution = extract_resolution(reply)
+        if resolution:
+            return {
+                "summary": f"Observed Behavior:\n{issue_text}",
+                "confidence": 0.85,
+                "recommended_solution": resolution
+            }
 
-    resp = client.chat.completions.create(
-        model="gpt-4o-mini",
-        messages=[{"role": "user", "content": prompt}],
-        temperature=0.2
-    )
-
+    # fallback (no solution found)
     return {
-        "summary": resp.choices[0].message.content,
+        "summary": f"Observed Behavior:\n{issue_text}",
         "confidence": 0.5,
-        "recommended_solution": "Review related tickets or collect more logs."
+        "recommended_solution": "Collect logs and escalate for investigation."
     }
 
 
-# ------------------ API ENDPOINT ------------------
+# ------------------ API ------------------
 @app.post("/ticket/details")
 async def ticket_details(req: TicketRequest):
-    comments_raw = await fetch_ticket(req.ticket_id)
-    comments_text = [c.get("body", "") for c in comments_raw]
+    comments = await fetch_comments(req.ticket_id)import os
+import re
+import httpx
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
 
-    analysis = analyze_ticket(comments_text)
+# ------------------ APP SETUP ------------------
+app = FastAPI()
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+ZENDESK_COOKIE = os.getenv("ZENDESK_COOKIE")
+
+# ------------------ MODELS ------------------
+class TicketRequest(BaseModel):
+    ticket_id: int
+
+
+# ------------------ CLEANING ------------------
+def clean(text: str) -> str:
+    if not text:
+        return ""
+
+    text = re.sub(r'\[cid:.*?\]', '', text)
+    text = re.sub(r'http\S+', '', text)
+    text = re.sub(r'[A-Za-z0-9]{25,}', '[REDACTED]', text)
+    text = re.sub(r'\s+', ' ', text)
+
+    return text.strip()
+
+
+# ------------------ EXTRACTION ------------------
+def extract_resolution(text: str) -> str | None:
+    patterns = [
+        r'please run .*?admin',
+        r'run .*?administrator',
+        r'resolved by .*',
+        r'workaround .*',
+        r'solution .*',
+    ]
+
+    for p in patterns:
+        m = re.search(p, text, re.I)
+        if m:
+            return m.group(0).capitalize()
+
+    return None
+
+
+# ------------------ ZENDESK ------------------
+async def fetch_comments(ticket_id: int):
+    url = f"https://castsoftware.zendesk.com/api/v2/tickets/{ticket_id}/comments.json"
+    headers = {"Cookie": ZENDESK_COOKIE}
+
+    async with httpx.AsyncClient(timeout=30) as client:
+        r = await client.get(url, headers=headers)
+        r.raise_for_status()
+        return r.json()["comments"]
+
+
+# ------------------ ANALYSIS ------------------
+def analyze(comments):
+    user_issue = []
+    agent_replies = []
+
+    for c in comments:
+        body = clean(c.get("body", ""))
+        if not body:
+            continue
+
+        author = c.get("author_id", "")
+        role = c.get("via", {}).get("source", {}).get("from", {}).get("name", "")
+
+        # Heuristic: agent replies usually shorter and directive
+        if "please" in body.lower() or "run" in body.lower():
+            agent_replies.append(body)
+        else:
+            user_issue.append(body)
+
+    issue_text = " ".join(user_issue[:2])
+
+    # 🔥 Look for solution in LAST agent reply
+    for reply in reversed(agent_replies):
+        resolution = extract_resolution(reply)
+        if resolution:
+            return {
+                "summary": f"Observed Behavior:\n{issue_text}",
+                "confidence": 0.85,
+                "recommended_solution": resolution
+            }
+
+    # fallback (no solution found)
+    return {
+        "summary": f"Observed Behavior:\n{issue_text}",
+        "confidence": 0.5,
+        "recommended_solution": "Collect logs and escalate for investigation."
+    }
+
+
+# ------------------ API ------------------
+@app.post("/ticket/details")
+async def ticket_details(req: TicketRequest):
+    comments = await fetch_comments(req.ticket_id)
+    result = analyze(comments)
 
     return {
-        "summary": analysis["summary"],
-        "confidence": analysis["confidence"],
+        "summary": result["summary"],
+        "confidence": result["confidence"],
         "related_tickets": [
             {
                 "id": req.ticket_id,
@@ -144,5 +227,5 @@ async def ticket_details(req: TicketRequest):
             }
         ],
         "related_docs": {},
-        "recommended_solution": analysis["recommended_solution"]
+        "recommended_solution": result["recommended_solution"]
     }
