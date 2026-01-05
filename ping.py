@@ -1,7 +1,4 @@
-@app.get("/ping")
-def ping():
-    return {"status": "ok"}
-    
+  
 @app.get("/env")
 def env_check():
     return {
