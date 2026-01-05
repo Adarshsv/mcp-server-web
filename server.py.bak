@@ -5,7 +5,6 @@ import os
 import functools
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 import httpx
 from openai import OpenAI
@@ -32,8 +31,15 @@ ZENDESK_SUBDOMAIN = os.getenv("ZENDESK_SUBDOMAIN", "")
 def get_openai_client():
     api_key = os.getenv("OPENAI_API_KEY")
     if not api_key:
-        raise RuntimeError("OPENAI_API_KEY is not set")
+        print("[Warning] OPENAI_API_KEY not set. AI analysis will be skipped.")
+        return None
     return OpenAI(api_key=api_key)
+
+# ---------------- GLOBAL ASYNC CLIENT ----------------
+async_client = httpx.AsyncClient(timeout=15)
+
+async def shutdown_client():
+    await async_client.aclose()
 
 # ---------------- APP ----------------
 app = FastAPI(title="CAST Ticket Analyzer")
@@ -45,6 +51,10 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+@app.on_event("shutdown")
+async def shutdown_event():
+    await shutdown_client()
+
 # ---------------- MODELS ----------------
 class TicketRequest(BaseModel):
     ticket_id: int
@@ -54,12 +64,19 @@ class QueryRequest(BaseModel):
 
 # ---------------- HELPERS ----------------
 def extract_keywords(text: str, max_words=8):
+    """
+    Extract meaningful keywords from ticket comments.
+    Uses simple regex, excludes generic words.
+    """
     words = re.findall(r"[A-Za-z][A-Za-z0-9_]{3,}", text)
-    blacklist = {"error", "issue", "problem", "unable", "failed"}
+    blacklist = {"error", "issue", "problem", "unable", "failed", "ticket", "please"}
     keywords = [w for w in words if w.lower() not in blacklist]
+
     # fallback if no keywords
     if not keywords:
         keywords = ["CAST"]
+
+    # truncate to max_words
     return " ".join(keywords[:max_words])
 
 # ---------------- ZENDESK ----------------
@@ -72,39 +89,33 @@ def zendesk_headers():
     }
 
 async def get_ticket_comments(ticket_id: int):
-    async with httpx.AsyncClient(timeout=15) as client:
-        r = await client.get(
-            f"https://{ZENDESK_SUBDOMAIN}.zendesk.com/api/v2/tickets/{ticket_id}/comments.json",
-            headers=zendesk_headers(),
-        )
-        r.raise_for_status()
-        return "\n".join(
-            c.get("plain_body", "")
-            for c in r.json().get("comments", [])
-        )
+    r = await async_client.get(
+        f"https://{ZENDESK_SUBDOMAIN}.zendesk.com/api/v2/tickets/{ticket_id}/comments.json",
+        headers=zendesk_headers(),
+    )
+    r.raise_for_status()
+    return "\n".join(
+        c.get("plain_body", "") for c in r.json().get("comments", [])
+    )
 
 async def search_related_tickets(query: str, ticket_id: int):
     """
     Search solved Zendesk tickets related to the query.
-    Falls back to last 3 solved tickets if no matches.
+    Uses OR search between keywords. Falls back to last 3 solved tickets if no matches.
     """
-    async with httpx.AsyncClient(timeout=15) as client:
-        keywords = query.split()
-        if not keywords:
-            keywords = ["error"]
-        zendesk_query = f"type:ticket status:solved ({' OR '.join(keywords)})"
-        print("Zendesk search query:", zendesk_query)
+    keywords = query.split() or ["CAST"]
+    zendesk_query = f"type:ticket status:solved ({' OR '.join(keywords)})"
+    print("Zendesk search query:", zendesk_query)
 
-        r = await client.get(
-            f"https://{ZENDESK_SUBDOMAIN}.zendesk.com/api/v2/search.json",
-            headers=zendesk_headers(),
-            params={"query": zendesk_query, "sort_by": "updated_at", "sort_order": "desc"}
-        )
-        r.raise_for_status()
+    r = await async_client.get(
+        f"https://{ZENDESK_SUBDOMAIN}.zendesk.com/api/v2/search.json",
+        headers=zendesk_headers(),
+        params={"query": zendesk_query, "sort_by": "updated_at", "sort_order": "desc"}
+    )
+    r.raise_for_status()
 
     results = r.json().get("results", [])
     related = []
-
     for t in results:
         if t["id"] == ticket_id:
             continue
@@ -117,7 +128,7 @@ async def search_related_tickets(query: str, ticket_id: int):
 
     if not related:
         print("No related tickets found. Fetching last 3 solved tickets as fallback.")
-        r = await client.get(
+        r = await async_client.get(
             f"https://{ZENDESK_SUBDOMAIN}.zendesk.com/api/v2/tickets.json",
             headers=zendesk_headers(),
             params={"status": "solved", "sort_by": "updated_at", "sort_order": "desc"}
@@ -139,10 +150,7 @@ def search_cast_docs(query: str):
     Returns top 3 docs. Fallbacks if no results.
     """
     docs = []
-    query = query.strip()
-    if not query:
-        query = "CAST AIP"
-
+    query = query.strip() or "CAST AIP"
     ddg_query = f"CAST AIP {query} site:doc.castsoftware.com"
     print("DDG search query:", ddg_query)
 
@@ -170,42 +178,35 @@ def search_cast_docs(query: str):
 
 # ---------------- AI ----------------
 def ai_analyze(context: str):
+    client = get_openai_client()
+    if not client:
+        return {"summary": "[AI analysis skipped]", "resolution": ""}
+
     try:
-        client = get_openai_client()
         response = client.chat.completions.create(
             model="gpt-4o-mini",
             temperature=0.1,
             messages=[
-                {
-                    "role": "system",
-                    "content": (
-                        "You are a CAST product support expert.\n"
-                        "Summarize the issue clearly and extract the concrete resolution.\n"
-                        "Respond strictly in this format:\n\n"
-                        "Summary:\n...\n\nResolution:\n..."
-                    )
-                },
-                {"role": "user", "content": context},
-            ],
+                {"role": "system",
+                 "content": "You are a CAST product support expert.\n"
+                            "Summarize the issue clearly and extract the concrete resolution.\n"
+                            "Respond strictly in this format:\n\nSummary:\n...\n\nResolution:\n..."},
+                {"role": "user", "content": context}
+            ]
         )
-
         text = response.choices[0].message.content.strip()
         summary = re.search(r"Summary:(.*?)(Resolution:|$)", text, re.S)
         resolution = re.search(r"Resolution:(.*)", text, re.S)
-
         return {
             "summary": summary.group(1).strip() if summary else text,
             "resolution": resolution.group(1).strip() if resolution else ""
         }
-
     except Exception as e:
-        return {
-            "summary": "[AI analysis failed]",
-            "resolution": str(e)
-        }
+        return {"summary": "[AI analysis failed]", "resolution": str(e)}
 
 # ---------------- CORE ----------------
 async def analyze_ticket(ticket_id: int):
+    print(f"Analyzing ticket {ticket_id}...")
     comments = await get_ticket_comments(ticket_id)
     keywords = extract_keywords(comments)
     print("Extracted keywords:", keywords)
@@ -213,14 +214,8 @@ async def analyze_ticket(ticket_id: int):
     related_tickets = await search_related_tickets(keywords, ticket_id)
     docs = await to_thread(functools.partial(search_cast_docs, keywords))
 
-    ai_context = f"""
-TICKET COMMENTS:
-{comments}
-"""
-
-    ai_result = await to_thread(
-        functools.partial(ai_analyze, ai_context)
-    )
+    ai_context = f"TICKET COMMENTS:\n{comments}"
+    ai_result = await to_thread(functools.partial(ai_analyze, ai_context))
 
     confidence = round(min(0.4 + len(related_tickets) * 0.15, 0.9), 2)
 
@@ -241,10 +236,7 @@ TICKET COMMENTS:
 @app.post("/ticket/details")
 async def ticket_details(req: TicketRequest):
     try:
-        return await asyncio.wait_for(
-            analyze_ticket(req.ticket_id),
-            timeout=25
-        )
+        return await asyncio.wait_for(analyze_ticket(req.ticket_id), timeout=40)
     except asyncio.TimeoutError:
         return {"error": "Request timed out"}
     except Exception as e:
