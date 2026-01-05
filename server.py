@@ -255,71 +255,7 @@ def show_env():
         "OPENAI_API_KEY_set": bool(os.getenv("OPENAI_API_KEY")),
     }
 
-# ---------------- UI ----------------
-@app.get("/", response_class=HTMLResponse)
-def home():
-    return """
-<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8">
-<title>CAST Ticket Analyzer</title>
-<style>
-body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background: #f0f2f5; margin:0; padding:0; }
-.container { max-width:1000px; margin:40px auto; padding:20px; }
-h1 { text-align:center; color:#333; }
-.controls { display:flex; justify-content:center; gap:10px; margin-bottom:20px; }
-input { padding:10px; width:150px; border-radius:5px; border:1px solid #ccc; }
-button { padding:10px 20px; background:#007bff; color:white; border:none; border-radius:5px; cursor:pointer; transition:.3s; }
-button:hover { background:#0056b3; }
-.card { background:white; padding:20px; margin-bottom:15px; border-radius:8px; box-shadow:0 3px 8px rgba(0,0,0,0.1); }
-.card h2 { margin-top:0; color:#007bff; font-size:18px; }
-.card pre { background:#f6f8fa; padding:10px; border-radius:5px; overflow-x:auto; }
-.resolution { background:#e6f7ff; border-left:5px solid #1890ff; padding:10px; font-weight:bold; }
-.grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(200px,1fr)); gap:10px; }
-.grid a { display:block; padding:10px; background:#f9f9f9; border-radius:5px; text-align:center; transition:.2s; }
-.grid a:hover { background:#007bff; color:white; }
-.spinner { border:6px solid #f3f3f3; border-top:6px solid #007bff; border-radius:50%; width:40px; height:40px; animation:spin 1s linear infinite; margin:auto; margin-top:20px; }
-@keyframes spin { 0% { transform:rotate(0deg); } 100% { transform:rotate(360deg); } }
-#progress { text-align:center; font-style:italic; color:#555; margin-bottom:15px; }
-</style>
-</head>
-<body>
-<div class="container">
-<h1>CAST Ticket Analyzer</h1>
-<div class="controls">
-<input id="ticket" placeholder="Ticket ID" />
-<button onclick="run()">Analyze</button>
-</div>
-<div id="progress"></div>
-<div id="out"></div>
-<script>
-async function run(){
-    const id=document.getElementById("ticket").value;
-    if(!id){ alert('Enter a ticket ID'); return; }
-    const outDiv=document.getElementById("out");
-    const progressDiv=document.getElementById("progress");
-    outDiv.innerHTML="";
-    progressDiv.innerHTML="<div class='spinner'></div><p>Fetching ticket data...</p>";
-    try{
-        const r=await fetch("/ticket/details",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({ticket_id:Number(id)})});
-        const d=await r.json();
-        if(d.error){ progressDiv.innerHTML=""; outDiv.innerHTML=`<p style="color:red;">Error: ${d.error}</p>`; return; }
-        progressDiv.innerHTML="<p>Analysis complete!</p>";
-        outDiv.innerHTML=`
-            <div class="card"><h2>Summary</h2><pre>${d.summary||'[No summary]'}</pre></div>
-            <div class="card"><h2>Confidence</h2><p>${d.confidence||0}</p></div>
-            <div class="card resolution"><h2>Recommended Solution</h2><pre>${d.recommended_solution||'[No solution]'}</pre></div>
-            <div class="card"><h2>Related Tickets</h2><div class="grid">${(d.related_tickets||[]).map(t=>`<a href="${t.url}" target="_blank">${t.id}</a>`).join("")||"<p>No related tickets</p>"}</div></div>
-            <div class="card"><h2>Documentation</h2><div class="grid">${(d.related_docs||[]).map(doc=>`<a href="${doc.url}" target="_blank">${doc.title}</a>`).join("")||"<p>No documentation found</p>"}</div></div>
-        `;
-    }catch(e){ progressDiv.innerHTML=""; outDiv.innerHTML=`<p style="color:red;">Fetch error: ${e}</p>`; }
-}
-</script>
-</div>
-</body>
-</html>
-"""
+
 # ---------------- START ----------------
 if __name__ == "__main__":
     import uvicorn
