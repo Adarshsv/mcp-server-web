@@ -1,146 +1,230 @@
+import asyncio
+import base64
 import os
 import re
-import asyncio
-from typing import Optional, List, Dict, Any
-
-from fastapi import FastAPI, HTTPException
+import functools
+from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
-
+import httpx
 from openai import OpenAI
 from duckduckgo_search import DDGS
+from asyncio import to_thread
 
-# -------------------- APP SETUP --------------------
+# ===================== ENV =====================
+REQUIRED_ENVS = [
+    "ZENDESK_EMAIL",
+    "ZENDESK_API_TOKEN",
+    "ZENDESK_SUBDOMAIN",
+]
 
+for e in REQUIRED_ENVS:
+    if not os.getenv(e):
+        print(f"[WARN] {e} not set")
+
+ZENDESK_EMAIL = os.getenv("ZENDESK_EMAIL", "")
+ZENDESK_API_TOKEN = os.getenv("ZENDESK_API_TOKEN", "")
+ZENDESK_SUBDOMAIN = os.getenv("ZENDESK_SUBDOMAIN", "")
+
+# ===================== APP =====================
 app = FastAPI(title="CAST Ticket Analyzer")
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-openai_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+# ===================== CLIENTS =====================
+async_client = httpx.AsyncClient(timeout=20)
 
-# -------------------- MODELS --------------------
+@app.on_event("shutdown")
+async def shutdown():
+    await async_client.aclose()
 
-class AnalyzeRequest(BaseModel):
-    ticket_id: Optional[int] = None
-    query: Optional[str] = None
+# ===================== MODELS =====================
+class UnifiedRequest(BaseModel):
+    input: str  # ticket id OR text
 
+# ===================== HELPERS =====================
+def zendesk_headers():
+    token = f"{ZENDESK_EMAIL}/token:{ZENDESK_API_TOKEN}"
+    encoded = base64.b64encode(token.encode()).decode()
+    return {
+        "Authorization": f"Basic {encoded}",
+        "Content-Type": "application/json",
+    }
 
-# -------------------- UTILITIES --------------------
+def expand_doc_query(query: str) -> str:
+    if len(query.split()) < 3:
+        return f"CAST AIP {query} rule violation analysis dashboard"
+    return f"CAST AIP {query}"
 
-GENERIC_DOCS = [
-    {"title": "CAST AIP Documentation Home", "url": "https://doc.castsoftware.com/"},
-    {"title": "CAST AIP Knowledge Base", "url": "https://doc.castsoftware.com/kb/"},
-    {"title": "CAST AIP Troubleshooting Guide", "url": "https://doc.castsoftware.com/troubleshoot/"},
-]
+# ===================== DOC SEARCH (FIRST) =====================
+def search_cast_docs(query: str):
+    docs = []
+    expanded = expand_doc_query(query)
+    q = f"{expanded} site:doc.castsoftware.com"
 
+    try:
+        with DDGS() as ddgs:
+            for r in ddgs.text(q, max_results=8):
+                docs.append({
+                    "title": r.get("title", "CAST Documentation"),
+                    "url": r.get("href"),
+                    "comment": f"Relevant to '{query}'"
+                })
+    except Exception as e:
+        print("Doc search failed:", e)
 
-def is_ticket_id(text: str) -> bool:
-    return bool(re.fullmatch(r"\d{4,7}", text.strip()))
+    if not docs:
+        return [{
+            "title": "CAST AIP Documentation Home",
+            "url": "https://doc.castsoftware.com/",
+            "comment": "General CAST documentation"
+        }]
 
+    return docs[:3]
 
-# -------------------- DOCUMENT SEARCH (FIRST) --------------------
+# ===================== ZENDESK =====================
+async def get_ticket_comments(ticket_id: int):
+    r = await async_client.get(
+        f"https://{ZENDESK_SUBDOMAIN}.zendesk.com/api/v2/tickets/{ticket_id}/comments.json",
+        headers=zendesk_headers(),
+    )
+    r.raise_for_status()
+    return "\n".join(c["plain_body"] for c in r.json()["comments"])
 
-async def search_docs(keyword: str) -> List[Dict[str, str]]:
+async def search_related_tickets(query: str, exclude_id: int | None):
+    zendesk_query = f"type:ticket status:solved {query}"
+    r = await async_client.get(
+        f"https://{ZENDESK_SUBDOMAIN}.zendesk.com/api/v2/search.json",
+        headers=zendesk_headers(),
+        params={"query": zendesk_query}
+    )
+    r.raise_for_status()
+
     results = []
-
-    with DDGS() as ddgs:
-        for r in ddgs.text(
-            f"{keyword} site:doc.castsoftware.com",
-            max_results=5
-        ):
-            results.append({
-                "title": r.get("title"),
-                "url": r.get("href"),
-                "comment": f"Mentions '{keyword}'"
-            })
+    for t in r.json().get("results", []):
+        if exclude_id and t["id"] == exclude_id:
+            continue
+        results.append({
+            "id": t["id"],
+            "url": f"https://{ZENDESK_SUBDOMAIN}.zendesk.com/agent/tickets/{t['id']}",
+            "comment": t.get("description", "")[:300]
+        })
+        if len(results) == 3:
+            break
 
     return results
 
+# ===================== AI (LAST, OPTIONAL) =====================
+def ai_analyze(text: str):
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        return {"summary": "", "resolution": ""}
 
-# -------------------- TICKET SEARCH (SECOND) --------------------
+    try:
+        client = OpenAI(api_key=api_key)
+        r = client.chat.completions.create(
+            model="gpt-4o-mini",
+            temperature=0.1,
+            messages=[
+                {"role": "system", "content": "You are a CAST support expert. Summarize and give resolution."},
+                {"role": "user", "content": text},
+            ],
+        )
+        return {
+            "summary": r.choices[0].message.content,
+            "resolution": ""
+        }
+    except Exception:
+        return {"summary": "", "resolution": ""}
 
-async def search_solved_tickets(keyword: str) -> List[Dict[str, Any]]:
-    """
-    Placeholder for Zendesk solved-ticket search.
-    Replace with real Zendesk API search.
-    """
-    return []
+# ===================== CORE =====================
+async def analyze_input(value: str):
+    # DOCS FIRST
+    docs = await to_thread(search_cast_docs, value)
 
+    # ticket or text?
+    if value.isdigit():
+        ticket_id = int(value)
+        comments = await get_ticket_comments(ticket_id)
+        tickets = await search_related_tickets(value, ticket_id)
+        ai = await to_thread(ai_analyze, comments)
+    else:
+        tickets = await search_related_tickets(value, None)
+        ai = await to_thread(ai_analyze, value)
 
-# -------------------- AI SUMMARY --------------------
-
-async def ai_summary(text: str) -> Dict[str, Any]:
-    resp = openai_client.chat.completions.create(
-        model="gpt-4o-mini",
-        messages=[
-            {"role": "system", "content": "You are a CAST AIP support expert."},
-            {"role": "user", "content": text}
-        ]
-    )
+    confidence = round(min(0.4 + len(tickets) * 0.15, 0.9), 2)
 
     return {
-        "summary": resp.choices[0].message.content.strip(),
-        "confidence": 0.85
+        "summary": ai.get("summary", ""),
+        "recommended_solution": ai.get("resolution", ""),
+        "confidence": confidence,
+        "related_tickets": tickets,
+        "related_docs": docs,
     }
 
+# ===================== ROUTES =====================
+@app.post("/analyze")
+async def analyze(req: UnifiedRequest):
+    return await analyze_input(req.input)
 
-# -------------------- CORE ANALYZER --------------------
+@app.get("/ping")
+def ping():
+    return {"status": "ok"}
 
-async def analyze_text(query: str) -> Dict[str, Any]:
-    response = {
-        "query": query,
-        "summary": "",
-        "recommended_solution": "",
-        "confidence": None,
-        "related_tickets": [],
-        "related_docs": []
-    }
+# ===================== UI =====================
+@app.get("/", response_class=HTMLResponse)
+def home():
+    return """
+<!DOCTYPE html>
+<html>
+<head>
+<title>CAST Ticket Analyzer</title>
+<style>
+body { font-family: Arial; max-width: 900px; margin: auto; padding: 20px; }
+input,button { padding: 10px; font-size: 16px; }
+.card { background: #f9f9f9; padding: 15px; margin-top: 15px; }
+</style>
+</head>
+<body>
 
-    # 1️⃣ DOC SEARCH FIRST
-    docs = await search_docs(query)
-    if docs:
-        response["related_docs"] = docs
-    else:
-        response["related_docs"] = GENERIC_DOCS
+<h2>CAST Ticket Analyzer</h2>
+<input id="q" placeholder="Ticket ID or search text" style="width:70%">
+<button onclick="run()">Analyze</button>
 
-    # 2️⃣ TICKET SEARCH
-    response["related_tickets"] = await search_solved_tickets(query)
+<div id="out"></div>
 
-    # 3️⃣ AI SUMMARY (NON-BLOCKING FEEL)
-    ai = await ai_summary(query)
-    response.update(ai)
+<script>
+async function run(){
+  out.innerHTML="Loading...";
+  const r = await fetch("/analyze",{
+    method:"POST",
+    headers:{ "Content-Type":"application/json" },
+    body: JSON.stringify({ input: q.value })
+  });
+  const d = await r.json();
 
-    return response
+  out.innerHTML = `
+    <div class="card"><b>Summary</b><pre>${d.summary||""}</pre></div>
+    <div class="card"><b>Confidence:</b> ${d.confidence}</div>
+    <div class="card"><b>Related Tickets</b>${
+      (d.related_tickets||[]).map(t=>`<p><a target=_blank href="${t.url}">${t.id}</a><br>${t.comment}</p>`).join("")
+    }</div>
+    <div class="card"><b>Documentation</b>${
+      (d.related_docs||[]).map(x=>`<p><a target=_blank href="${x.url}">${x.title}</a><br>${x.comment}</p>`).join("")
+    }</div>`;
+}
+</script>
+</body>
+</html>
+"""
 
-
-# -------------------- ROUTES --------------------
-
-@app.post("/ticket/analyze")
-async def analyze(req: AnalyzeRequest):
-    if req.ticket_id:
-        return await analyze_text(str(req.ticket_id))
-
-    if req.query:
-        if is_ticket_id(req.query):
-            return await analyze_text(req.query)
-        return await analyze_text(req.query)
-
-    raise HTTPException(status_code=400, detail="ticket_id or query required")
-
-
-# -------------------- BACKWARD COMPAT --------------------
-
-@app.post("/ticket/details")
-async def ticket_details(req: AnalyzeRequest):
-    return await analyze(req)
-
-
-@app.post("/ticket/search")
-async def ticket_search(req: AnalyzeRequest):
-    return await analyze(req)
+# ===================== START =====================
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", 8080)))
