@@ -186,10 +186,6 @@ def ping():
 # ---------------- FRONTEND ----------------
 @app.get("/", response_class=HTMLResponse)
 def home():
-    return "<h1>CAST Ticket Analyzer</h1><p>Use /ping or /ticket/details</p>"
-
-@app.get("/", response_class=HTMLResponse)
-def home():
     return """
 <!DOCTYPE html>
 <html>
