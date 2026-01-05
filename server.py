@@ -20,7 +20,6 @@ REQUIRED_ENVS = [
     "OPENAI_API_KEY",
 ]
 
-# Safe env var loading
 for e in REQUIRED_ENVS:
     if not os.getenv(e):
         print(f"Warning: {e} is missing. API calls may fail.")
@@ -28,9 +27,13 @@ for e in REQUIRED_ENVS:
 ZENDESK_EMAIL = os.getenv("ZENDESK_EMAIL", "")
 ZENDESK_API_TOKEN = os.getenv("ZENDESK_API_TOKEN", "")
 ZENDESK_SUBDOMAIN = os.getenv("ZENDESK_SUBDOMAIN", "")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 
-ai_client = OpenAI(api_key=OPENAI_API_KEY)
+# ---------------- OPENAI (LAZY INIT) ----------------
+def get_openai_client():
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        raise RuntimeError("OPENAI_API_KEY is not set")
+    return OpenAI(api_key=api_key)
 
 # ---------------- APP ----------------
 app = FastAPI(title="CAST Ticket Analyzer")
@@ -53,7 +56,10 @@ class QueryRequest(BaseModel):
 def zendesk_headers():
     auth = f"{ZENDESK_EMAIL}/token:{ZENDESK_API_TOKEN}"
     encoded = base64.b64encode(auth.encode()).decode()
-    return {"Authorization": f"Basic {encoded}", "Content-Type": "application/json"}
+    return {
+        "Authorization": f"Basic {encoded}",
+        "Content-Type": "application/json"
+    }
 
 async def get_ticket_comments(ticket_id: int):
     try:
@@ -63,7 +69,10 @@ async def get_ticket_comments(ticket_id: int):
                 headers=zendesk_headers(),
             )
             r.raise_for_status()
-            return "\n".join(c.get("plain_body", "") for c in r.json().get("comments", []))
+            return "\n".join(
+                c.get("plain_body", "")
+                for c in r.json().get("comments", [])
+            )
     except Exception as e:
         return f"[Error fetching comments: {str(e)}]"
 
@@ -99,37 +108,56 @@ def search_cast_docs(query: str):
     docs = []
     try:
         with DDGS() as ddgs:
-            results = ddgs.text(f"site:doc.castsoftware.com {query}", max_results=5)
+            results = ddgs.text(
+                f"site:doc.castsoftware.com {query}",
+                max_results=5
+            )
             for r in results:
-                docs.append({"title": r["title"], "url": r["href"]})
+                docs.append({
+                    "title": r["title"],
+                    "url": r["href"]
+                })
     except Exception:
         pass
     return docs
 
+# ---------------- AI ----------------
 def ai_analyze(context: str):
     try:
-        response = ai_client.chat.completions.create(
+        client = get_openai_client()
+
+        response = client.chat.completions.create(
             model="gpt-4o-mini",
             temperature=0.1,
             messages=[
-                {"role": "system", "content": (
-                    "You are a CAST product support expert.\n"
-                    "Summarize the issue clearly and extract the concrete resolution.\n"
-                    "Respond strictly in this format:\n\n"
-                    "Summary:\n...\n\nResolution:\n..."
-                )},
+                {
+                    "role": "system",
+                    "content": (
+                        "You are a CAST product support expert.\n"
+                        "Summarize the issue clearly and extract the concrete resolution.\n"
+                        "Respond strictly in this format:\n\n"
+                        "Summary:\n...\n\nResolution:\n..."
+                    )
+                },
                 {"role": "user", "content": context},
             ],
         )
+
         text = response.choices[0].message.content.strip()
         summary = re.search(r"Summary:(.*?)(Resolution:|$)", text, re.S)
         resolution = re.search(r"Resolution:(.*)", text, re.S)
+
         return {
             "summary": summary.group(1).strip() if summary else text,
-            "resolution": resolution.group(1).strip() if resolution else "No clear resolution identified."
+            "resolution": resolution.group(1).strip()
+            if resolution else "No clear resolution identified."
         }
+
     except Exception as e:
-        return {"summary": "[AI analysis failed]", "resolution": f"[Error: {str(e)}]"}
+        return {
+            "summary": "[AI analysis failed]",
+            "resolution": f"[Error: {str(e)}]"
+        }
 
 # ---------------- CORE LOGIC ----------------
 async def analyze_ticket(ticket_id: int):
@@ -138,7 +166,10 @@ async def analyze_ticket(ticket_id: int):
         snippet = comments[:200]
 
         similar_task = search_similar_tickets(snippet)
-        docs_task = to_thread(functools.partial(search_cast_docs, snippet))
+        docs_task = to_thread(
+            functools.partial(search_cast_docs, snippet)
+        )
+
         similar_tickets, resolved_context = await similar_task
         docs = await docs_task
 
@@ -149,8 +180,14 @@ TICKET COMMENTS:
 SIMILAR RESOLVED TICKETS:
 {resolved_context}
 """
-        ai_result = await to_thread(functools.partial(ai_analyze, ai_context))
-        confidence = round(min(0.4 + len(similar_tickets) * 0.15, 0.9), 2)
+
+        ai_result = await to_thread(
+            functools.partial(ai_analyze, ai_context)
+        )
+
+        confidence = round(
+            min(0.4 + len(similar_tickets) * 0.15, 0.9), 2
+        )
 
         return {
             "summary": ai_result["summary"],
@@ -159,6 +196,7 @@ SIMILAR RESOLVED TICKETS:
             "related_tickets": similar_tickets,
             "related_docs": docs,
         }
+
     except Exception as e:
         return {"error": f"Failed to analyze ticket: {str(e)}"}
 
@@ -166,7 +204,10 @@ SIMILAR RESOLVED TICKETS:
 @app.post("/ticket/details")
 async def ticket_details(req: TicketRequest):
     try:
-        return await asyncio.wait_for(analyze_ticket(req.ticket_id), timeout=25)
+        return await asyncio.wait_for(
+            analyze_ticket(req.ticket_id),
+            timeout=25
+        )
     except asyncio.TimeoutError:
         return {"error": "Request timed out. Please try again later."}
     except Exception as e:
@@ -175,7 +216,11 @@ async def ticket_details(req: TicketRequest):
 @app.post("/search/docs")
 async def search_docs(req: QueryRequest):
     try:
-        return {"related_docs": await to_thread(functools.partial(search_cast_docs, req.query))}
+        return {
+            "related_docs": await to_thread(
+                functools.partial(search_cast_docs, req.query)
+            )
+        }
     except Exception as e:
         return {"related_docs": [], "error": str(e)}
 
@@ -183,7 +228,18 @@ async def search_docs(req: QueryRequest):
 def ping():
     return {"status": "ok"}
 
+@app.get("/env")
+def show_env():
+    return {
+        "ZENDESK_EMAIL_set": bool(os.getenv("ZENDESK_EMAIL")),
+        "ZENDESK_API_TOKEN_set": bool(os.getenv("ZENDESK_API_TOKEN")),
+        "ZENDESK_SUBDOMAIN_set": bool(os.getenv("ZENDESK_SUBDOMAIN")),
+        "OPENAI_API_KEY_set": bool(os.getenv("OPENAI_API_KEY")),
+        "OPENAI_keys": [k for k in os.environ if "OPENAI" in k],
+    }
+
 # ---------------- FRONTEND ----------------
+	
 @app.get("/", response_class=HTMLResponse)
 def home():
     return """
@@ -266,14 +322,6 @@ async function run() {
 </body>
 </html>
 """
-@app.get("/env")
-def show_env():
-    return {
-        "ZENDESK_EMAIL_set": bool(os.getenv("ZENDESK_EMAIL")),
-        "ZENDESK_API_TOKEN_set": bool(os.getenv("ZENDESK_API_TOKEN")),
-        "ZENDESK_SUBDOMAIN_set": bool(os.getenv("ZENDESK_SUBDOMAIN")),
-        "OPENAI_API_KEY_set": bool(os.getenv("OPENAI_API_KEY")),
-    }
 
 # ---------------- START ----------------
 if __name__ == "__main__":
