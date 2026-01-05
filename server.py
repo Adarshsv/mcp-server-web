@@ -255,6 +255,54 @@ def show_env():
         "OPENAI_API_KEY_set": bool(os.getenv("OPENAI_API_KEY")),
     }
 
+# ---------------- UI ----------------
+@app.get("/", response_class=HTMLResponse)
+def home():
+    return """
+<!DOCTYPE html>
+<html>
+<head>
+<title>CAST Ticket Analyzer</title>
+<style>
+body { font-family: Arial; max-width: 900px; margin: auto; padding: 20px; }
+button { padding: 10px; background: #007bff; color: white; border: none; }
+.card { background: #f9f9f9; padding: 15px; margin-top: 15px; }
+</style>
+</head>
+<body>
+<h1>CAST Ticket Analyzer</h1>
+
+<input id="ticket" placeholder="Ticket ID">
+<button onclick="run()">Analyze</button>
+
+<div id="out"></div>
+
+<script>
+async function run(){
+  const id = document.getElementById("ticket").value;
+  const r = await fetch("/ticket/details",{
+    method:"POST",
+    headers:{"Content-Type":"application/json"},
+    body:JSON.stringify({ticket_id:Number(id)})
+  });
+  const d = await r.json();
+
+  document.getElementById("out").innerHTML = `
+    <div class="card"><b>Summary</b><pre>${d.summary}</pre></div>
+    <div class="card"><b>Confidence</b>: ${d.confidence}</div>
+    <div class="card"><b>Recommended Solution</b><pre>${d.recommended_solution}</pre></div>
+    <div class="card"><b>Related Tickets</b>${
+      d.related_tickets.map(t=>`<p><a href="${t.url}" target="_blank">${t.id}</a></p>`).join("")
+    }</div>
+    <div class="card"><b>Documentation</b>${
+      d.related_docs.map(d=>`<p><a href="${d.url}" target="_blank">${d.title}</a></p>`).join("")
+    }</div>
+  `;
+}
+</script>
+</body>
+</html>
+"""
 
 # ---------------- START ----------------
 if __name__ == "__main__":
