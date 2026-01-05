@@ -1,20 +1,33 @@
 import os
 import sys
 import base64
+import asyncio
 import re
 import httpx
-import asyncio
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
+from duckduckgo_search import DDGS
 from openai import OpenAI
 
-# ------------------ CONFIG ------------------
-ZENDESK_SUBDOMAIN = os.getenv("ZENDESK_SUBDOMAIN", "castsoftware")
-OPENAI_KEY = os.getenv("OPENAI_API_KEY")
+# ---------------- ENV VALIDATION ----------------
+REQUIRED_ENVS = [
+    "ZENDESK_EMAIL",
+    "ZENDESK_API_TOKEN",
+    "ZENDESK_SUBDOMAIN",
+    "OPENAI_API_KEY",
+]
 
-# ------------------ APP ------------------
+missing = [e for e in REQUIRED_ENVS if not os.getenv(e)]
+if missing:
+    raise RuntimeError(f"Missing environment variables: {missing}")
+
+ZENDESK_SUBDOMAIN = os.getenv("ZENDESK_SUBDOMAIN")
+
+ai_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+
+# ---------------- APP ----------------
 app = FastAPI(title="CAST Ticket Analyzer")
 
 app.add_middleware(
@@ -24,147 +37,141 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ------------------ OPENAI ------------------
-openai_client = OpenAI(api_key=OPENAI_KEY) if OPENAI_KEY else None
-
-# ------------------ AUTH ------------------
-def zendesk_headers():
-    email = os.getenv("ZENDESK_EMAIL")
-    token = os.getenv("ZENDESK_API_TOKEN")
-
-    if not email or not token:
-        raise HTTPException(500, "Zendesk credentials missing")
-
-    auth = base64.b64encode(
-        f"{email}/token:{token}".encode()
-    ).decode()
-
-    return {
-        "Authorization": f"Basic {auth}",
-        "Content-Type": "application/json",
-        "User-Agent": "CAST-Ticket-Analyzer"
-    }
-
-# ------------------ MODELS ------------------
+# ---------------- MODELS ----------------
 class TicketRequest(BaseModel):
     ticket_id: int
 
-# ------------------ TEXT CLEANING ------------------
-def clean_text(text: str) -> str:
-    text = re.sub(r"\[cid:.*?\]", "", text)
-    text = re.sub(r"http\S+", "", text)
-    text = re.sub(r"Regards,.*", "", text, flags=re.I | re.S)
-    text = re.sub(r"\s{2,}", " ", text)
-    return text.strip()
+class QueryRequest(BaseModel):
+    query: str
 
-# ------------------ COMMENT PROCESSING ------------------
-def split_comments(comments):
-    user_msgs, agent_msgs = [], []
-
-    for c in comments:
-        body = clean_text(c.get("plain_body") or c.get("body", ""))
-        if not body:
-            continue
-
-        if c.get("public"):
-            if c.get("author_id"):
-                user_msgs.append(body)
-            else:
-                agent_msgs.append(body)
-
-    return user_msgs, agent_msgs
-
-# ------------------ OPENAI SUMMARY ------------------
-def openai_summarize(user_text, agent_text):
-    if not openai_client:
-        return None, None
-
-    prompt = f"""
-You are a CAST Software support engineer.
-
-Ticket description:
-{user_text}
-
-Agent responses:
-{agent_text}
-
-Tasks:
-1. Summarize the observed issue in 3–4 clear sentences.
-2. Extract or infer the most likely resolution.
-3. Be precise, technical, and concise.
-"""
-
-    try:
-        resp = openai_client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.2,
-        )
-
-        text = resp.choices[0].message.content.strip()
-        parts = text.split("Resolution:")
-
-        summary = parts[0].strip()
-        resolution = parts[1].strip() if len(parts) > 1 else None
-
-        return summary, resolution
-
-    except Exception as e:
-        print("[OpenAI error]", e, file=sys.stderr)
-        return None, None
-
-# ------------------ ANALYSIS ------------------
-async def analyze_ticket(ticket_id: int):
-    headers = zendesk_headers()
-
-    async with httpx.AsyncClient(timeout=30) as client:
-        resp = await client.get(
-            f"https://{ZENDESK_SUBDOMAIN}.zendesk.com/api/v2/tickets/{ticket_id}/comments.json",
-            headers=headers
-        )
-        resp.raise_for_status()
-
-    comments = resp.json().get("comments", [])
-    user_msgs, agent_msgs = split_comments(comments)
-
-    raw_user = " ".join(user_msgs[:5])
-    raw_agent = " ".join(agent_msgs[:5])
-
-    ai_summary, ai_resolution = openai_summarize(raw_user, raw_agent)
-
-    summary = ai_summary or (
-        raw_user[:500]
-        if raw_user
-        else "Issue reported but no clear reproduction steps found."
-    )
-
-    resolution = ai_resolution or (
-        raw_agent[:400]
-        if raw_agent
-        else "Collect logs and escalate for further investigation."
-    )
-
-    confidence = round(
-        min(0.4 + (0.3 if ai_summary else 0.1), 0.9), 2
-    )
-
+# ---------------- ZENDESK AUTH ----------------
+def zendesk_headers():
+    auth = f"{os.getenv('ZENDESK_EMAIL')}/token:{os.getenv('ZENDESK_API_TOKEN')}"
+    encoded = base64.b64encode(auth.encode()).decode()
     return {
-        "summary": summary,
-        "confidence": confidence,
-        "related_tickets": [{
-            "id": ticket_id,
-            "url": f"https://{ZENDESK_SUBDOMAIN}.zendesk.com/agent/tickets/{ticket_id}"
-        }],
-        "related_docs": [],
-        "recommended_solution": resolution
+        "Authorization": f"Basic {encoded}",
+        "Content-Type": "application/json",
     }
 
-# ------------------ API ------------------
+# ---------------- HELPERS ----------------
+async def get_ticket_comments(ticket_id: int):
+    async with httpx.AsyncClient(timeout=30) as client:
+        r = await client.get(
+            f"https://{ZENDESK_SUBDOMAIN}.zendesk.com/api/v2/tickets/{ticket_id}/comments.json",
+            headers=zendesk_headers(),
+        )
+        r.raise_for_status()
+        return "\n".join(
+            c["plain_body"]
+            for c in r.json().get("comments", [])
+            if c.get("plain_body")
+        )
+
+async def search_similar_tickets(query: str):
+    async with httpx.AsyncClient(timeout=30) as client:
+        r = await client.get(
+            f"https://{ZENDESK_SUBDOMAIN}.zendesk.com/api/v2/search.json",
+            headers=zendesk_headers(),
+            params={
+                "query": f"type:ticket status:solved {query}"
+            },
+        )
+        r.raise_for_status()
+        results = r.json().get("results", [])[:5]
+
+        tickets = []
+        resolutions = ""
+
+        for t in results:
+            tickets.append({
+                "id": t["id"],
+                "url": f"https://{ZENDESK_SUBDOMAIN}.zendesk.com/agent/tickets/{t['id']}"
+            })
+            resolutions += await get_ticket_comments(t["id"])[-1500:]
+
+        return tickets, resolutions
+
+def search_cast_docs(query: str):
+    docs = []
+    try:
+        with DDGS() as ddgs:
+            results = ddgs.text(
+                f"site:doc.castsoftware.com {query}",
+                max_results=5
+            )
+            for r in results:
+                docs.append({
+                    "title": r["title"],
+                    "url": r["href"]
+                })
+    except Exception:
+        pass
+    return docs
+
+def ai_analyze(context: str):
+    response = ai_client.chat.completions.create(
+        model="gpt-4o-mini",
+        temperature=0.1,
+        messages=[
+            {
+                "role": "system",
+                "content": (
+                    "You are a CAST product support expert.\n"
+                    "Summarize the issue clearly and extract the concrete resolution.\n"
+                    "Respond strictly in this format:\n\n"
+                    "Summary:\n...\n\nResolution:\n..."
+                ),
+            },
+            {"role": "user", "content": context},
+        ],
+    )
+
+    text = response.choices[0].message.content.strip()
+
+    summary = re.search(r"Summary:(.*?)(Resolution:|$)", text, re.S)
+    resolution = re.search(r"Resolution:(.*)", text, re.S)
+
+    return {
+        "summary": summary.group(1).strip() if summary else text,
+        "resolution": resolution.group(1).strip() if resolution else "No clear resolution identified."
+    }
+
+# ---------------- CORE LOGIC ----------------
+async def analyze_ticket(ticket_id: int):
+    comments = await get_ticket_comments(ticket_id)
+    similar_tickets, resolved_context = await search_similar_tickets(comments[:200])
+    docs = search_cast_docs(comments[:200])
+
+    ai_context = f"""
+TICKET COMMENTS:
+{comments}
+
+SIMILAR RESOLVED TICKETS:
+{resolved_context}
+"""
+
+    ai_result = ai_analyze(ai_context)
+
+    confidence = round(min(0.4 + len(similar_tickets) * 0.15, 0.9), 2)
+
+    return {
+        "summary": ai_result["summary"],
+        "recommended_solution": ai_result["resolution"],
+        "confidence": confidence,
+        "related_tickets": similar_tickets,
+        "related_docs": docs,
+    }
+
+# ---------------- ROUTES ----------------
 @app.post("/ticket/details")
 async def ticket_details(req: TicketRequest):
     return await analyze_ticket(req.ticket_id)
 
-# ------------------ UI ------------------
+@app.post("/search/docs")
+async def search_docs(req: QueryRequest):
+    return {"related_docs": search_cast_docs(req.query)}
+
+# ---------------- UI ----------------
 @app.get("/", response_class=HTMLResponse)
 def home():
     return """
@@ -173,10 +180,9 @@ def home():
 <head>
 <title>CAST Ticket Analyzer</title>
 <style>
-body { font-family: Arial; background:#f4f4f4; padding:40px; max-width:900px; margin:auto; }
-input, button { padding:10px; width:100%; margin:8px 0; }
-button { background:#007bff; color:white; border:none; cursor:pointer; }
-.card { background:white; padding:15px; margin-top:15px; border-radius:6px; }
+body { font-family: Arial; max-width: 900px; margin: auto; padding: 20px; }
+button { padding: 10px; background: #007bff; color: white; border: none; }
+.card { background: #f9f9f9; padding: 15px; margin-top: 15px; }
 </style>
 </head>
 <body>
@@ -188,19 +194,25 @@ button { background:#007bff; color:white; border:none; cursor:pointer; }
 <div id="out"></div>
 
 <script>
-async function run() {
+async function run(){
   const id = document.getElementById("ticket").value;
-  const res = await fetch("/ticket/details", {
-    method: "POST",
-    headers: {"Content-Type":"application/json"},
-    body: JSON.stringify({ticket_id: parseInt(id)})
+  const r = await fetch("/ticket/details",{
+    method:"POST",
+    headers:{"Content-Type":"application/json"},
+    body:JSON.stringify({ticket_id:Number(id)})
   });
-  const data = await res.json();
+  const d = await r.json();
 
   document.getElementById("out").innerHTML = `
-    <div class="card"><b>Summary</b><pre>${data.summary}</pre></div>
-    <div class="card"><b>Confidence</b>: ${data.confidence}</div>
-    <div class="card"><b>Recommended Solution</b><pre>${data.recommended_solution}</pre></div>
+    <div class="card"><b>Summary</b><pre>${d.summary}</pre></div>
+    <div class="card"><b>Confidence</b>: ${d.confidence}</div>
+    <div class="card"><b>Recommended Solution</b><pre>${d.recommended_solution}</pre></div>
+    <div class="card"><b>Related Tickets</b>${
+      d.related_tickets.map(t=>`<p><a href="${t.url}" target="_blank">${t.id}</a></p>`).join("")
+    }</div>
+    <div class="card"><b>Documentation</b>${
+      d.related_docs.map(d=>`<p><a href="${d.url}" target="_blank">${d.title}</a></p>`).join("")
+    }</div>
   `;
 }
 </script>
