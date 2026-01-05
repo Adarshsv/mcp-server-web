@@ -2,6 +2,7 @@ import asyncio
 import base64
 import re
 import os
+import functools
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
@@ -10,7 +11,6 @@ import httpx
 from openai import OpenAI
 from duckduckgo_search import DDGS
 from asyncio import to_thread
-import functools
 
 # ---------------- ENV ----------------
 REQUIRED_ENVS = [
@@ -52,6 +52,13 @@ class TicketRequest(BaseModel):
 class QueryRequest(BaseModel):
     query: str
 
+# ---------------- HELPERS ----------------
+def extract_keywords(text: str, max_words=8):
+    words = re.findall(r"[A-Za-z][A-Za-z0-9_]{3,}", text)
+    blacklist = {"error", "issue", "problem", "unable", "failed"}
+    keywords = [w for w in words if w.lower() not in blacklist]
+    return " ".join(keywords[:max_words])
+
 # ---------------- ZENDESK ----------------
 def zendesk_headers():
     auth = f"{ZENDESK_EMAIL}/token:{ZENDESK_API_TOKEN}"
@@ -62,54 +69,48 @@ def zendesk_headers():
     }
 
 async def get_ticket_comments(ticket_id: int):
-    try:
-        async with httpx.AsyncClient(timeout=15) as client:
-            r = await client.get(
-                f"https://{ZENDESK_SUBDOMAIN}.zendesk.com/api/v2/tickets/{ticket_id}/comments.json",
-                headers=zendesk_headers(),
-            )
-            r.raise_for_status()
-            return "\n".join(
-                c.get("plain_body", "")
-                for c in r.json().get("comments", [])
-            )
-    except Exception as e:
-        return f"[Error fetching comments: {str(e)}]"
+    async with httpx.AsyncClient(timeout=15) as client:
+        r = await client.get(
+            f"https://{ZENDESK_SUBDOMAIN}.zendesk.com/api/v2/tickets/{ticket_id}/comments.json",
+            headers=zendesk_headers(),
+        )
+        r.raise_for_status()
+        return "\n".join(
+            c.get("plain_body", "")
+            for c in r.json().get("comments", [])
+        )
 
-async def search_similar_tickets(query: str):
-    try:
-        async with httpx.AsyncClient(timeout=15) as client:
-            r = await client.get(
-                f"https://{ZENDESK_SUBDOMAIN}.zendesk.com/api/v2/search.json",
-                headers=zendesk_headers(),
-                params={"query": f"type:ticket status:solved {query}"}
-            )
-            r.raise_for_status()
-            results = r.json().get("results", [])[:5]
+async def search_related_tickets(query: str, ticket_id: int):
+    async with httpx.AsyncClient(timeout=15) as client:
+        r = await client.get(
+            f"https://{ZENDESK_SUBDOMAIN}.zendesk.com/api/v2/search.json",
+            headers=zendesk_headers(),
+            params={"query": f"type:ticket status:solved {query}"}
+        )
+        r.raise_for_status()
 
-        tickets = []
-        resolved_context = ""
-        tasks = [get_ticket_comments(t["id"]) for t in results]
-        comments_list = await asyncio.gather(*tasks, return_exceptions=True)
+    results = r.json().get("results", [])
 
-        for idx, t in enumerate(results):
-            tickets.append({
-                "id": t["id"],
-                "url": f"https://{ZENDESK_SUBDOMAIN}.zendesk.com/agent/tickets/{t['id']}"
-            })
-            comment_text = comments_list[idx] if isinstance(comments_list[idx], str) else ""
-            resolved_context += comment_text[-1500:]
+    related = []
+    for t in results:
+        if t["id"] == ticket_id:
+            continue
+        related.append({
+            "id": t["id"],
+            "url": f"https://{ZENDESK_SUBDOMAIN}.zendesk.com/agent/tickets/{t['id']}"
+        })
+        if len(related) == 3:
+            break
 
-        return tickets, resolved_context
-    except Exception as e:
-        return [], f"[Error fetching similar tickets: {str(e)}]"
+    return related
 
+# ---------------- DOC SEARCH ----------------
 def search_cast_docs(query: str):
     docs = []
     try:
         with DDGS() as ddgs:
             results = ddgs.text(
-                f"site:doc.castsoftware.com {query}",
+                f"CAST AIP {query} site:doc.castsoftware.com",
                 max_results=5
             )
             for r in results:
@@ -119,13 +120,13 @@ def search_cast_docs(query: str):
                 })
     except Exception:
         pass
-    return docs
+
+    return docs[:3]
 
 # ---------------- AI ----------------
 def ai_analyze(context: str):
     try:
         client = get_openai_client()
-
         response = client.chat.completions.create(
             model="gpt-4o-mini",
             temperature=0.1,
@@ -149,56 +150,46 @@ def ai_analyze(context: str):
 
         return {
             "summary": summary.group(1).strip() if summary else text,
-            "resolution": resolution.group(1).strip()
-            if resolution else "No clear resolution identified."
+            "resolution": resolution.group(1).strip() if resolution else ""
         }
 
     except Exception as e:
         return {
             "summary": "[AI analysis failed]",
-            "resolution": f"[Error: {str(e)}]"
+            "resolution": str(e)
         }
 
-# ---------------- CORE LOGIC ----------------
+# ---------------- CORE ----------------
 async def analyze_ticket(ticket_id: int):
-    try:
-        comments = await get_ticket_comments(ticket_id)
-        snippet = comments[:200]
+    comments = await get_ticket_comments(ticket_id)
+    keywords = extract_keywords(comments)
 
-        similar_task = search_similar_tickets(snippet)
-        docs_task = to_thread(
-            functools.partial(search_cast_docs, snippet)
-        )
+    related_tickets = await search_related_tickets(keywords, ticket_id)
+    docs = await to_thread(functools.partial(search_cast_docs, keywords))
 
-        similar_tickets, resolved_context = await similar_task
-        docs = await docs_task
-
-        ai_context = f"""
+    ai_context = f"""
 TICKET COMMENTS:
 {comments}
-
-SIMILAR RESOLVED TICKETS:
-{resolved_context}
 """
 
-        ai_result = await to_thread(
-            functools.partial(ai_analyze, ai_context)
-        )
+    ai_result = await to_thread(
+        functools.partial(ai_analyze, ai_context)
+    )
 
-        confidence = round(
-            min(0.4 + len(similar_tickets) * 0.15, 0.9), 2
-        )
+    confidence = round(min(0.4 + len(related_tickets) * 0.15, 0.9), 2)
 
-        return {
-            "summary": ai_result["summary"],
-            "recommended_solution": ai_result["resolution"],
-            "confidence": confidence,
-            "related_tickets": similar_tickets,
-            "related_docs": docs,
-        }
-
-    except Exception as e:
-        return {"error": f"Failed to analyze ticket: {str(e)}"}
+    return {
+        "summary": ai_result["summary"],
+        "recommended_solution": ai_result["resolution"],
+        "confidence": confidence,
+        "primary_ticket": {
+            "id": ticket_id,
+            "url": f"https://{ZENDESK_SUBDOMAIN}.zendesk.com/agent/tickets/{ticket_id}",
+            "primary": True
+        },
+        "related_tickets": related_tickets,
+        "related_docs": docs,
+    }
 
 # ---------------- ROUTES ----------------
 @app.post("/ticket/details")
@@ -209,20 +200,9 @@ async def ticket_details(req: TicketRequest):
             timeout=25
         )
     except asyncio.TimeoutError:
-        return {"error": "Request timed out. Please try again later."}
+        return {"error": "Request timed out"}
     except Exception as e:
         return {"error": str(e)}
-
-@app.post("/search/docs")
-async def search_docs(req: QueryRequest):
-    try:
-        return {
-            "related_docs": await to_thread(
-                functools.partial(search_cast_docs, req.query)
-            )
-        }
-    except Exception as e:
-        return {"related_docs": [], "error": str(e)}
 
 @app.get("/ping")
 def ping():
@@ -235,102 +215,7 @@ def show_env():
         "ZENDESK_API_TOKEN_set": bool(os.getenv("ZENDESK_API_TOKEN")),
         "ZENDESK_SUBDOMAIN_set": bool(os.getenv("ZENDESK_SUBDOMAIN")),
         "OPENAI_API_KEY_set": bool(os.getenv("OPENAI_API_KEY")),
-        "OPENAI_keys": [k for k in os.environ if "OPENAI" in k],
     }
-    
-@app.get("/env/debug")
-def env_debug():
-    return {
-        "RAILWAY_SERVICE_NAME": os.getenv("RAILWAY_SERVICE_NAME"),
-        "RAILWAY_ENVIRONMENT": os.getenv("RAILWAY_ENVIRONMENT"),
-        "ALL_ENV_KEYS": sorted(list(os.environ.keys())),
-    }
-
-
-# ---------------- FRONTEND ----------------
-	
-@app.get("/", response_class=HTMLResponse)
-def home():
-    return """
-<!DOCTYPE html>
-<html>
-<head>
-<title>CAST Ticket Analyzer</title>
-<style>
-body { font-family: Arial; max-width: 900px; margin: auto; padding: 20px; }
-button { padding: 10px; background: #007bff; color: white; border: none; cursor: pointer; }
-button:disabled { background: #aaa; cursor: not-allowed; }
-.card { background: #f9f9f9; padding: 15px; margin-top: 15px; border-radius: 6px; box-shadow: 0 2px 5px rgba(0,0,0,0.1); }
-pre { white-space: pre-wrap; word-break: break-word; }
-#error { color: red; font-weight: bold; margin-top: 10px; }
-</style>
-</head>
-<body>
-<h1>CAST Ticket Analyzer</h1>
-<input id="ticket" placeholder="Ticket ID">
-<button id="analyzeBtn" onclick="run()">Analyze</button>
-<div id="error"></div>
-<div id="out"></div>
-
-<script>
-async function run() {
-  const id = document.getElementById("ticket").value.trim();
-  const btn = document.getElementById("analyzeBtn");
-  const out = document.getElementById("out");
-  const errorDiv = document.getElementById("error");
-
-  out.innerHTML = "";
-  errorDiv.innerText = "";
-  if (!id || isNaN(id)) {
-    errorDiv.innerText = "Please enter a valid ticket ID.";
-    return;
-  }
-
-  btn.disabled = true;
-  btn.innerText = "Analyzing...";
-
-  try {
-    const r = await fetch("/ticket/details", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ ticket_id: Number(id) })
-    });
-    const d = await r.json();
-
-    if (d.error) {
-      errorDiv.innerText = d.error;
-      out.innerHTML = "";
-      return;
-    }
-
-    out.innerHTML = `
-      <div class="card"><b>Summary</b><pre>${d.summary || "N/A"}</pre></div>
-      <div class="card"><b>Confidence</b>: ${d.confidence !== undefined ? d.confidence : "N/A"}</div>
-      <div class="card"><b>Recommended Solution</b><pre>${d.recommended_solution || "N/A"}</pre></div>
-      <div class="card"><b>Related Tickets</b>${
-        d.related_tickets && d.related_tickets.length > 0
-          ? d.related_tickets.map(t => `<p><a href="${t.url}" target="_blank">${t.id}</a></p>`).join("")
-          : "<p>No related tickets found.</p>"
-      }</div>
-      <div class="card"><b>Documentation</b>${
-        d.related_docs && d.related_docs.length > 0
-          ? d.related_docs.map(doc => `<p><a href="${doc.url}" target="_blank">${doc.title}</a></p>`).join("")
-          : "<p>No related docs found.</p>"
-      }</div>
-    `;
-  } catch (err) {
-    console.error(err);
-    errorDiv.innerText = "Failed to fetch ticket details. Please check your connection or try again later.";
-    out.innerHTML = "";
-  } finally {
-    btn.disabled = false;
-    btn.innerText = "Analyze";
-  }
-}
-</script>
-</body>
-</html>
-"""
 
 # ---------------- START ----------------
 if __name__ == "__main__":
@@ -338,6 +223,3 @@ if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
     print(f"Starting CAST Ticket Analyzer on port {port}...")
     uvicorn.run(app, host="0.0.0.0", port=port)
-    
-    
- 

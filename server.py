@@ -57,6 +57,9 @@ def extract_keywords(text: str, max_words=8):
     words = re.findall(r"[A-Za-z][A-Za-z0-9_]{3,}", text)
     blacklist = {"error", "issue", "problem", "unable", "failed"}
     keywords = [w for w in words if w.lower() not in blacklist]
+    # fallback if no keywords
+    if not keywords:
+        keywords = ["CAST"]
     return " ".join(keywords[:max_words])
 
 # ---------------- ZENDESK ----------------
@@ -81,17 +84,27 @@ async def get_ticket_comments(ticket_id: int):
         )
 
 async def search_related_tickets(query: str, ticket_id: int):
+    """
+    Search solved Zendesk tickets related to the query.
+    Falls back to last 3 solved tickets if no matches.
+    """
     async with httpx.AsyncClient(timeout=15) as client:
+        keywords = query.split()
+        if not keywords:
+            keywords = ["error"]
+        zendesk_query = f"type:ticket status:solved ({' OR '.join(keywords)})"
+        print("Zendesk search query:", zendesk_query)
+
         r = await client.get(
             f"https://{ZENDESK_SUBDOMAIN}.zendesk.com/api/v2/search.json",
             headers=zendesk_headers(),
-            params={"query": f"type:ticket status:solved {query}"}
+            params={"query": zendesk_query, "sort_by": "updated_at", "sort_order": "desc"}
         )
         r.raise_for_status()
 
     results = r.json().get("results", [])
-
     related = []
+
     for t in results:
         if t["id"] == ticket_id:
             continue
@@ -102,24 +115,56 @@ async def search_related_tickets(query: str, ticket_id: int):
         if len(related) == 3:
             break
 
+    if not related:
+        print("No related tickets found. Fetching last 3 solved tickets as fallback.")
+        r = await client.get(
+            f"https://{ZENDESK_SUBDOMAIN}.zendesk.com/api/v2/tickets.json",
+            headers=zendesk_headers(),
+            params={"status": "solved", "sort_by": "updated_at", "sort_order": "desc"}
+        )
+        r.raise_for_status()
+        for t in r.json().get("tickets", [])[:3]:
+            if t["id"] != ticket_id:
+                related.append({
+                    "id": t["id"],
+                    "url": f"https://{ZENDESK_SUBDOMAIN}.zendesk.com/agent/tickets/{t['id']}"
+                })
+
     return related
 
 # ---------------- DOC SEARCH ----------------
 def search_cast_docs(query: str):
+    """
+    Search CAST documentation using DuckDuckGo.
+    Returns top 3 docs. Fallbacks if no results.
+    """
     docs = []
+    query = query.strip()
+    if not query:
+        query = "CAST AIP"
+
+    ddg_query = f"CAST AIP {query} site:doc.castsoftware.com"
+    print("DDG search query:", ddg_query)
+
     try:
         with DDGS() as ddgs:
-            results = ddgs.text(
-                f"CAST AIP {query} site:doc.castsoftware.com",
-                max_results=5
-            )
+            results = ddgs.text(ddg_query, max_results=5)
             for r in results:
                 docs.append({
-                    "title": r["title"],
-                    "url": r["href"]
+                    "title": r.get("title", "Untitled"),
+                    "url": r.get("href")
                 })
-    except Exception:
-        pass
+    except Exception as e:
+        print("DDGS search failed:", e)
+
+    if not docs:
+        print("No docs found. Using fallback CAST documentation URLs.")
+        fallback_docs = [
+            {"title": "CAST AIP Documentation Home", "url": "https://doc.castsoftware.com/"},
+            {"title": "CAST AIP Knowledge Base", "url": "https://doc.castsoftware.com/kb/"},
+            {"title": "CAST AIP Troubleshooting Guide", "url": "https://doc.castsoftware.com/troubleshoot/"},
+        ]
+        docs.extend(fallback_docs[:3])
 
     return docs[:3]
 
@@ -163,6 +208,7 @@ def ai_analyze(context: str):
 async def analyze_ticket(ticket_id: int):
     comments = await get_ticket_comments(ticket_id)
     keywords = extract_keywords(comments)
+    print("Extracted keywords:", keywords)
 
     related_tickets = await search_related_tickets(keywords, ticket_id)
     docs = await to_thread(functools.partial(search_cast_docs, keywords))
