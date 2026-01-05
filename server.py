@@ -72,7 +72,6 @@ def extract_keywords(text: str, max_words=8):
         keywords = ["CAST"]
     return " ".join(keywords[:max_words])
 
-# ---------------- ZENDESK ----------------
 def zendesk_headers():
     auth = f"{ZENDESK_EMAIL}/token:{ZENDESK_API_TOKEN}"
     encoded = base64.b64encode(auth.encode()).decode()
@@ -89,8 +88,7 @@ async def get_ticket_comments(ticket_id: int):
     r.raise_for_status()
     return "\n".join(c.get("plain_body", "") for c in r.json().get("comments", []))
 
-async def search_related_tickets(query: str, exclude_ticket_ids=None, limit=3):
-    exclude_ticket_ids = exclude_ticket_ids or []
+async def search_related_tickets(query: str, ticket_id: int):
     keywords = query.split() or ["CAST"]
     zendesk_query = f"type:ticket status:solved ({' OR '.join(keywords)})"
     r = await async_client.get(
@@ -99,18 +97,20 @@ async def search_related_tickets(query: str, exclude_ticket_ids=None, limit=3):
         params={"query": zendesk_query, "sort_by": "updated_at", "sort_order": "desc"}
     )
     r.raise_for_status()
-
     results = r.json().get("results", [])
     related = []
     for t in results:
-        if t["id"] in exclude_ticket_ids:
+        if t["id"] == ticket_id:
             continue
-        related.append({"id": t["id"], "url": f"https://{ZENDESK_SUBDOMAIN}.zendesk.com/agent/tickets/{t['id']}"})
-        if len(related) == limit:
+        related.append({
+            "id": t["id"],
+            "url": f"https://{ZENDESK_SUBDOMAIN}.zendesk.com/agent/tickets/{t['id']}",
+            "comment": (t.get("description") or "")[:80]
+        })
+        if len(related) == 3:
             break
     return related
 
-# ---------------- DOC SEARCH ----------------
 def search_cast_docs(query: str):
     docs = []
     query = query.strip() or "CAST AIP"
@@ -119,20 +119,23 @@ def search_cast_docs(query: str):
         with DDGS() as ddgs:
             results = ddgs.text(ddg_query, max_results=5)
             for r in results:
-                docs.append({"title": r.get("title", "Untitled"), "url": r.get("href")})
+                docs.append({
+                    "title": r.get("title", "Untitled"),
+                    "url": r.get("href"),
+                    "comment": (r.get("body") or "")[:80]
+                })
     except Exception as e:
         print("DDGS search failed:", e)
 
     if not docs:
         fallback_docs = [
-            {"title": "CAST AIP Documentation Home", "url": "https://doc.castsoftware.com/"},
-            {"title": "CAST AIP Knowledge Base", "url": "https://doc.castsoftware.com/kb/"},
-            {"title": "CAST AIP Troubleshooting Guide", "url": "https://doc.castsoftware.com/troubleshoot/"},
+            {"title": "CAST AIP Documentation Home", "url": "https://doc.castsoftware.com/", "comment": ""},
+            {"title": "CAST AIP Knowledge Base", "url": "https://doc.castsoftware.com/kb/", "comment": ""},
+            {"title": "CAST AIP Troubleshooting Guide", "url": "https://doc.castsoftware.com/troubleshoot/", "comment": ""},
         ]
         docs.extend(fallback_docs[:3])
     return docs[:3]
 
-# ---------------- AI ----------------
 def ai_analyze(context: str):
     client = get_openai_client()
     if not client:
@@ -163,19 +166,36 @@ def ai_analyze(context: str):
 async def analyze_ticket(ticket_id: int):
     comments = await get_ticket_comments(ticket_id)
     keywords = extract_keywords(comments)
-    related_tickets = await search_related_tickets(keywords, exclude_ticket_ids=[ticket_id])
+    related_tickets = await search_related_tickets(keywords, ticket_id)
     docs = await to_thread(functools.partial(search_cast_docs, keywords))
     ai_context = f"TICKET COMMENTS:\n{comments}"
     ai_result = await to_thread(functools.partial(ai_analyze, ai_context))
     confidence = round(min(0.4 + len(related_tickets) * 0.15, 0.9), 2)
-
     return {
         "summary": ai_result["summary"],
         "recommended_solution": ai_result["resolution"],
         "confidence": confidence,
-        "primary_ticket": {"id": ticket_id, "url": f"https://{ZENDESK_SUBDOMAIN}.zendesk.com/agent/tickets/{ticket_id}", "primary": True},
+        "primary_ticket": {
+            "id": ticket_id,
+            "url": f"https://{ZENDESK_SUBDOMAIN}.zendesk.com/agent/tickets/{ticket_id}",
+            "primary": True
+        },
         "related_tickets": related_tickets,
         "related_docs": docs,
+    }
+
+async def text_search(query: str):
+    related_tickets = await search_related_tickets(query, 0)
+    docs = await to_thread(functools.partial(search_cast_docs, query))
+    # AI summary of all found tickets combined
+    combined_text = "\n".join([t["comment"] for t in related_tickets])
+    ai_result = await to_thread(functools.partial(ai_analyze, combined_text)) if combined_text else {"summary": "", "resolution": ""}
+    return {
+        "query": query,
+        "summary": ai_result["summary"],
+        "recommended_solution": ai_result["resolution"],
+        "related_tickets": related_tickets,
+        "related_docs": docs
     }
 
 # ---------------- ROUTES ----------------
@@ -190,27 +210,12 @@ async def ticket_details(req: TicketRequest):
 
 @app.post("/ticket/search")
 async def ticket_search(req: QueryRequest):
-    query = req.query.strip()
-    keywords = extract_keywords(query)
-    # Step 1: search solved tickets
-    related = await search_related_tickets(keywords, exclude_ticket_ids=[], limit=3)
-    # Step 2: fetch AI summary & resolution for each ticket
-    tickets_with_summary = []
-    for t in related:
-        try:
-            comments = await get_ticket_comments(t["id"])
-            ai_result = await to_thread(functools.partial(ai_analyze, f"TICKET COMMENTS:\n{comments}"))
-            tickets_with_summary.append({
-                "id": t["id"],
-                "url": t["url"],
-                "summary": ai_result["summary"],
-                "recommended_solution": ai_result["resolution"]
-            })
-        except Exception as e:
-            tickets_with_summary.append({"id": t["id"], "url": t["url"], "summary": "[Failed]", "recommended_solution": str(e)})
-    # Step 3: fetch CAST docs
-    docs = await to_thread(functools.partial(search_cast_docs, keywords))
-    return {"query": query, "related_tickets": tickets_with_summary, "related_docs": docs}
+    try:
+        return await asyncio.wait_for(text_search(req.query), timeout=40)
+    except asyncio.TimeoutError:
+        return {"error": "Search timed out"}
+    except Exception as e:
+        return {"error": str(e)}
 
 @app.get("/ping")
 def ping():
@@ -234,23 +239,23 @@ def home():
 <head>
 <title>CAST Ticket Analyzer</title>
 <style>
-body { font-family: Arial; max-width: 1000px; margin: auto; padding: 20px; background:#f2f2f2; }
+body { font-family: Arial; max-width: 900px; margin: auto; padding: 20px; }
 button { padding: 10px; background: #007bff; color: white; border: none; cursor:pointer; }
-button:hover { background:#0056b3; }
-input { padding:10px; width:250px; margin-right:10px; }
-.card { background: white; padding: 15px; margin-top: 15px; border-radius:6px; box-shadow:0 2px 5px rgba(0,0,0,0.1); }
-.summary { background:#fff8dc; padding:10px; border-left:5px solid #ff9800; }
-.solution { background:#e8f5e9; padding:10px; border-left:5px solid #4caf50; }
-a { color:#007bff; text-decoration:none; }
-a:hover { text-decoration:underline; }
+.card { background: #f9f9f9; padding: 15px; margin-top: 15px; border-radius:6px; box-shadow:0 2px 4px rgba(0,0,0,0.1);}
+.card pre { background:#eef; padding:10px; border-radius:4px; }
+.card a { text-decoration:none; color:#007bff; }
+.card a:hover { text-decoration:underline; }
 </style>
 </head>
 <body>
 <h1>CAST Ticket Analyzer</h1>
 
+<h2>Ticket Lookup</h2>
 <input id="ticket" placeholder="Ticket ID">
-<input id="query" placeholder="Text Search">
 <button onclick="runTicket()">Analyze Ticket</button>
+
+<h2>Text Search</h2>
+<input id="query" placeholder="Enter keywords">
 <button onclick="runSearch()">Text Search</button>
 
 <div id="out"></div>
@@ -258,46 +263,83 @@ a:hover { text-decoration:underline; }
 <script>
 async function runTicket(){
   const id = document.getElementById("ticket").value;
+  const out = document.getElementById("out");
+  out.innerHTML = "<p>Loading ticket details...</p>";
+
   const r = await fetch("/ticket/details",{
     method:"POST",
     headers:{"Content-Type":"application/json"},
     body:JSON.stringify({ticket_id:Number(id)})
   });
   const d = await r.json();
-  document.getElementById("out").innerHTML = `
-    <div class="card summary"><b>Summary</b><pre>${d.summary}</pre></div>
-    <div class="card solution"><b>Recommended Solution</b><pre>${d.recommended_solution}</pre></div>
-    <div class="card"><b>Confidence</b>: ${d.confidence}</div>
-    <div class="card"><b>Related Tickets</b>${
-      d.related_tickets.map(t=>`<p><a href="${t.url}" target="_blank">${t.id}</a></p>`).join("")
-    }</div>
-    <div class="card"><b>Documentation</b>${
-      d.related_docs.map(d=>`<p><a href="${d.url}" target="_blank">${d.title}</a></p>`).join("")
-    }</div>
-  `;
+
+  out.innerHTML = `<div class="card"><b>Summary</b><pre>${d.summary}</pre></div>`;
+
+  if(d.recommended_solution){
+    out.innerHTML += `<div class="card"><b>Recommended Solution</b><pre>${d.recommended_solution}</pre></div>`;
+  } else {
+    out.innerHTML += `<div class="card"><b>Recommended Solution</b><p>Loading...</p></div>`;
+  }
+
+  out.innerHTML += `<div class="card"><b>Confidence</b>: ${d.confidence}</div>`;
+
+  if(d.related_tickets && d.related_tickets.length){
+    let html = '<div class="card"><b>Related Tickets</b>';
+    d.related_tickets.forEach(t=>{
+      html += `<p><a href="${t.url}" target="_blank">${t.id}</a> - ${t.comment || ''}</p>`;
+    });
+    html += '</div>';
+    out.innerHTML += html;
+  }
+
+  if(d.related_docs && d.related_docs.length){
+    let html = '<div class="card"><b>Related Docs</b>';
+    d.related_docs.forEach(t=>{
+      html += `<p><a href="${t.url}" target="_blank">${t.title}</a> - ${t.comment || ''}</p>`;
+    });
+    html += '</div>';
+    out.innerHTML += html;
+  }
 }
 
 async function runSearch(){
   const query = document.getElementById("query").value;
+  const out = document.getElementById("out");
+  out.innerHTML = "<p>Searching...</p>";
+
   const r = await fetch("/ticket/search",{
     method:"POST",
     headers:{"Content-Type":"application/json"},
     body:JSON.stringify({query})
   });
   const d = await r.json();
-  document.getElementById("out").innerHTML = `
-    <div class="card"><b>Text Search Query</b>: ${d.query}</div>
-    <div class="card"><b>Related Tickets</b>${
-      d.related_tickets.map(t=>`
-        <p><a href="${t.url}" target="_blank">${t.id}</a></p>
-        <div class="summary"><pre>${t.summary}</pre></div>
-        <div class="solution"><pre>${t.recommended_solution}</pre></div>
-      `).join("")
-    }</div>
-    <div class="card"><b>Related Documentation</b>${
-      d.related_docs.map(d=>`<p><a href="${d.url}" target="_blank">${d.title}</a></p>`).join("")
-    }</div>
-  `;
+
+  let html = `<div class="card"><b>Query</b>: ${d.query}</div>`;
+
+  if(d.related_tickets && d.related_tickets.length){
+    html += '<div class="card"><b>Related Tickets</b>';
+    d.related_tickets.forEach(t=>{
+      html += `<p><a href="${t.url}" target="_blank">${t.id}</a> - ${t.comment || ''}</p>`;
+    });
+    html += '</div>';
+  }
+
+  if(d.related_docs && d.related_docs.length){
+    html += '<div class="card"><b>Related Docs</b>';
+    d.related_docs.forEach(t=>{
+      html += `<p><a href="${t.url}" target="_blank">${t.title}</a> - ${t.comment || ''}</p>`;
+    });
+    html += '</div>';
+  }
+
+  if(d.summary){
+    html += `<div class="card"><b>Summary</b><pre>${d.summary}</pre></div>`;
+  }
+  if(d.recommended_solution){
+    html += `<div class="card"><b>Recommended Solution</b><pre>${d.recommended_solution}</pre></div>`;
+  }
+
+  out.innerHTML = html;
 }
 </script>
 </body>
