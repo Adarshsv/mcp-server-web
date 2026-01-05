@@ -1,4 +1,3 @@
-  
 @app.get("/env")
 def env_check():
     return {
