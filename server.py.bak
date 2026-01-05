@@ -188,6 +188,15 @@ def ping():
 def home():
     return "<h1>CAST Ticket Analyzer</h1><p>Use /ping or /ticket/details</p>"
 
+# ---------------- START ----------------
+if __name__ == "__main__":
+    import uvicorn
+    port = int(os.environ.get("PORT", 8080))
+    print(f"Starting CAST Ticket Analyzer on port {port}...")
+    uvicorn.run(app, host="0.0.0.0", port=port)
+
+
+
 @app.get("/", response_class=HTMLResponse)
 def home():
     return """
@@ -270,10 +279,3 @@ async function run() {
 </body>
 </html>
 """
-
-# ---------------- START ----------------
-if __name__ == "__main__":
-    import uvicorn
-    port = int(os.environ.get("PORT", 8080))
-    print(f"Starting CAST Ticket Analyzer on port {port}...")
-    uvicorn.run(app, host="0.0.0.0", port=port)
