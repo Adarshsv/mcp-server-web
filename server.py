@@ -5,6 +5,7 @@ import os
 import functools
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 import httpx
 from openai import OpenAI
@@ -38,7 +39,8 @@ def get_openai_client():
 # ---------------- GLOBAL ASYNC CLIENT ----------------
 async_client = httpx.AsyncClient(timeout=15)
 
-async def shutdown_client():
+@app.on_event("shutdown")
+async def shutdown_event():
     await async_client.aclose()
 
 # ---------------- APP ----------------
@@ -51,10 +53,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-@app.on_event("shutdown")
-async def shutdown_event():
-    await shutdown_client()
-
 # ---------------- MODELS ----------------
 class TicketRequest(BaseModel):
     ticket_id: int
@@ -64,29 +62,18 @@ class QueryRequest(BaseModel):
 
 # ---------------- HELPERS ----------------
 def extract_keywords(text: str, max_words=8):
-    """
-    Extract meaningful keywords from ticket comments.
-    Uses simple regex, excludes generic words.
-    """
     words = re.findall(r"[A-Za-z][A-Za-z0-9_]{3,}", text)
     blacklist = {"error", "issue", "problem", "unable", "failed", "ticket", "please"}
     keywords = [w for w in words if w.lower() not in blacklist]
-
-    # fallback if no keywords
     if not keywords:
         keywords = ["CAST"]
-
-    # truncate to max_words
     return " ".join(keywords[:max_words])
 
 # ---------------- ZENDESK ----------------
 def zendesk_headers():
     auth = f"{ZENDESK_EMAIL}/token:{ZENDESK_API_TOKEN}"
     encoded = base64.b64encode(auth.encode()).decode()
-    return {
-        "Authorization": f"Basic {encoded}",
-        "Content-Type": "application/json"
-    }
+    return {"Authorization": f"Basic {encoded}", "Content-Type": "application/json"}
 
 async def get_ticket_comments(ticket_id: int):
     r = await async_client.get(
@@ -94,40 +81,24 @@ async def get_ticket_comments(ticket_id: int):
         headers=zendesk_headers(),
     )
     r.raise_for_status()
-    return "\n".join(
-        c.get("plain_body", "") for c in r.json().get("comments", [])
-    )
+    return "\n".join(c.get("plain_body", "") for c in r.json().get("comments", []))
 
 async def search_related_tickets(query: str, ticket_id: int):
-    """
-    Search solved Zendesk tickets related to the query.
-    Uses OR search between keywords. Falls back to last 3 solved tickets if no matches.
-    """
     keywords = query.split() or ["CAST"]
     zendesk_query = f"type:ticket status:solved ({' OR '.join(keywords)})"
-    print("Zendesk search query:", zendesk_query)
-
     r = await async_client.get(
         f"https://{ZENDESK_SUBDOMAIN}.zendesk.com/api/v2/search.json",
         headers=zendesk_headers(),
         params={"query": zendesk_query, "sort_by": "updated_at", "sort_order": "desc"}
     )
     r.raise_for_status()
-
     results = r.json().get("results", [])
     related = []
     for t in results:
-        if t["id"] == ticket_id:
-            continue
-        related.append({
-            "id": t["id"],
-            "url": f"https://{ZENDESK_SUBDOMAIN}.zendesk.com/agent/tickets/{t['id']}"
-        })
-        if len(related) == 3:
-            break
-
+        if t["id"] == ticket_id: continue
+        related.append({"id": t["id"], "url": f"https://{ZENDESK_SUBDOMAIN}.zendesk.com/agent/tickets/{t['id']}"})
+        if len(related) == 3: break
     if not related:
-        print("No related tickets found. Fetching last 3 solved tickets as fallback.")
         r = await async_client.get(
             f"https://{ZENDESK_SUBDOMAIN}.zendesk.com/api/v2/tickets.json",
             headers=zendesk_headers(),
@@ -136,44 +107,28 @@ async def search_related_tickets(query: str, ticket_id: int):
         r.raise_for_status()
         for t in r.json().get("tickets", [])[:3]:
             if t["id"] != ticket_id:
-                related.append({
-                    "id": t["id"],
-                    "url": f"https://{ZENDESK_SUBDOMAIN}.zendesk.com/agent/tickets/{t['id']}"
-                })
-
+                related.append({"id": t["id"], "url": f"https://{ZENDESK_SUBDOMAIN}.zendesk.com/agent/tickets/{t['id']}"})
     return related
 
 # ---------------- DOC SEARCH ----------------
 def search_cast_docs(query: str):
-    """
-    Search CAST documentation using DuckDuckGo.
-    Returns top 3 docs. Fallbacks if no results.
-    """
     docs = []
     query = query.strip() or "CAST AIP"
     ddg_query = f"CAST AIP {query} site:doc.castsoftware.com"
-    print("DDG search query:", ddg_query)
-
     try:
         with DDGS() as ddgs:
             results = ddgs.text(ddg_query, max_results=5)
             for r in results:
-                docs.append({
-                    "title": r.get("title", "Untitled"),
-                    "url": r.get("href")
-                })
-    except Exception as e:
-        print("DDGS search failed:", e)
-
+                docs.append({"title": r.get("title", "Untitled"), "url": r.get("href")})
+    except:
+        pass
     if not docs:
-        print("No docs found. Using fallback CAST documentation URLs.")
         fallback_docs = [
             {"title": "CAST AIP Documentation Home", "url": "https://doc.castsoftware.com/"},
             {"title": "CAST AIP Knowledge Base", "url": "https://doc.castsoftware.com/kb/"},
             {"title": "CAST AIP Troubleshooting Guide", "url": "https://doc.castsoftware.com/troubleshoot/"},
         ]
         docs.extend(fallback_docs[:3])
-
     return docs[:3]
 
 # ---------------- AI ----------------
@@ -181,55 +136,38 @@ def ai_analyze(context: str):
     client = get_openai_client()
     if not client:
         return {"summary": "[AI analysis skipped]", "resolution": ""}
-
     try:
         response = client.chat.completions.create(
             model="gpt-4o-mini",
             temperature=0.1,
             messages=[
-                {"role": "system",
-                 "content": "You are a CAST product support expert.\n"
-                            "Summarize the issue clearly and extract the concrete resolution.\n"
-                            "Respond strictly in this format:\n\nSummary:\n...\n\nResolution:\n..."},
+                {"role": "system", "content": "You are a CAST product support expert.\nSummarize the issue and resolution in format:\nSummary:\n...\nResolution:\n..."},
                 {"role": "user", "content": context}
             ]
         )
         text = response.choices[0].message.content.strip()
         summary = re.search(r"Summary:(.*?)(Resolution:|$)", text, re.S)
         resolution = re.search(r"Resolution:(.*)", text, re.S)
-        return {
-            "summary": summary.group(1).strip() if summary else text,
-            "resolution": resolution.group(1).strip() if resolution else ""
-        }
+        return {"summary": summary.group(1).strip() if summary else text, "resolution": resolution.group(1).strip() if resolution else ""}
     except Exception as e:
         return {"summary": "[AI analysis failed]", "resolution": str(e)}
 
 # ---------------- CORE ----------------
 async def analyze_ticket(ticket_id: int):
-    print(f"Analyzing ticket {ticket_id}...")
     comments = await get_ticket_comments(ticket_id)
     keywords = extract_keywords(comments)
-    print("Extracted keywords:", keywords)
-
     related_tickets = await search_related_tickets(keywords, ticket_id)
     docs = await to_thread(functools.partial(search_cast_docs, keywords))
-
     ai_context = f"TICKET COMMENTS:\n{comments}"
     ai_result = await to_thread(functools.partial(ai_analyze, ai_context))
-
-    confidence = round(min(0.4 + len(related_tickets) * 0.15, 0.9), 2)
-
+    confidence = round(min(0.4 + len(related_tickets)*0.15, 0.9), 2)
     return {
         "summary": ai_result["summary"],
         "recommended_solution": ai_result["resolution"],
         "confidence": confidence,
-        "primary_ticket": {
-            "id": ticket_id,
-            "url": f"https://{ZENDESK_SUBDOMAIN}.zendesk.com/agent/tickets/{ticket_id}",
-            "primary": True
-        },
+        "primary_ticket": {"id": ticket_id, "url": f"https://{ZENDESK_SUBDOMAIN}.zendesk.com/agent/tickets/{ticket_id}", "primary": True},
         "related_tickets": related_tickets,
-        "related_docs": docs,
+        "related_docs": docs
     }
 
 # ---------------- ROUTES ----------------
@@ -264,9 +202,12 @@ def home():
 <head>
 <title>CAST Ticket Analyzer</title>
 <style>
-body { font-family: Arial; max-width: 900px; margin: auto; padding: 20px; }
-button { padding: 10px; background: #007bff; color: white; border: none; }
-.card { background: #f9f9f9; padding: 15px; margin-top: 15px; }
+body { font-family: Arial; max-width: 900px; margin: auto; padding: 20px; background: #f0f2f5; }
+button { padding: 10px; background: #007bff; color: white; border: none; border-radius: 5px; cursor: pointer; }
+button:hover { background: #0056b3; }
+input { padding: 10px; width: 150px; border-radius: 5px; border: 1px solid #ccc; }
+.card { background: #fff; padding: 15px; margin-top: 15px; border-radius: 8px; box-shadow: 0 3px 6px rgba(0,0,0,0.1); }
+.card pre { background: #f6f8fa; padding: 10px; border-radius: 5px; overflow-x: auto; }
 </style>
 </head>
 <body>
@@ -280,24 +221,34 @@ button { padding: 10px; background: #007bff; color: white; border: none; }
 <script>
 async function run(){
   const id = document.getElementById("ticket").value;
-  const r = await fetch("/ticket/details",{
-    method:"POST",
-    headers:{"Content-Type":"application/json"},
-    body:JSON.stringify({ticket_id:Number(id)})
-  });
-  const d = await r.json();
+  if(!id){ alert("Please enter a ticket ID."); return; }
+  const outDiv = document.getElementById("out");
+  outDiv.innerHTML = "<p>Loading...</p>";
 
-  document.getElementById("out").innerHTML = `
-    <div class="card"><b>Summary</b><pre>${d.summary}</pre></div>
-    <div class="card"><b>Confidence</b>: ${d.confidence}</div>
-    <div class="card"><b>Recommended Solution</b><pre>${d.recommended_solution}</pre></div>
-    <div class="card"><b>Related Tickets</b>${
-      d.related_tickets.map(t=>`<p><a href="${t.url}" target="_blank">${t.id}</a></p>`).join("")
-    }</div>
-    <div class="card"><b>Documentation</b>${
-      d.related_docs.map(d=>`<p><a href="${d.url}" target="_blank">${d.title}</a></p>`).join("")
-    }</div>
-  `;
+  try{
+    const r = await fetch("/ticket/details",{
+      method:"POST",
+      headers:{"Content-Type":"application/json"},
+      body: JSON.stringify({ticket_id:Number(id)})
+    });
+    const d = await r.json();
+
+    if(d.error){ outDiv.innerHTML = `<p style="color:red;">Error: ${d.error}</p>`; return; }
+
+    outDiv.innerHTML = `
+      <div class="card"><b>Summary</b><pre>${d.summary || "[No summary]"}</pre></div>
+      <div class="card"><b>Confidence</b>: ${d.confidence || 0}</div>
+      <div class="card" style="border-left:5px solid #007bff;"><b>Recommended Solution</b><pre>${d.recommended_solution || "[No solution]"}</pre></div>
+      <div class="card"><b>Related Tickets</b>${
+        (d.related_tickets || []).map(t=>`<p><a href="${t.url}" target="_blank">${t.id}</a></p>`).join("") || "<p>No related tickets</p>"
+      }</div>
+      <div class="card"><b>Documentation</b>${
+        (d.related_docs || []).map(doc=>`<p><a href="${doc.url}" target="_blank">${doc.title}</a></p>`).join("") || "<p>No documentation</p>"
+      }</div>
+    `;
+  }catch(e){
+    outDiv.innerHTML = `<p style="color:red;">Fetch error: ${e}</p>`;
+  }
 }
 </script>
 </body>
