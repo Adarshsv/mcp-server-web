@@ -1,230 +1,193 @@
-import asyncio
-import base64
 import os
 import re
-import functools
-from fastapi import FastAPI
+import asyncio
+from typing import Optional, List, Dict, Any
+
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
-import httpx
+
 from openai import OpenAI
 from duckduckgo_search import DDGS
-from asyncio import to_thread
 
-# ===================== ENV =====================
-REQUIRED_ENVS = [
-    "ZENDESK_EMAIL",
-    "ZENDESK_API_TOKEN",
-    "ZENDESK_SUBDOMAIN",
-]
+# ================== APP SETUP ==================
 
-for e in REQUIRED_ENVS:
-    if not os.getenv(e):
-        print(f"[WARN] {e} not set")
-
-ZENDESK_EMAIL = os.getenv("ZENDESK_EMAIL", "")
-ZENDESK_API_TOKEN = os.getenv("ZENDESK_API_TOKEN", "")
-ZENDESK_SUBDOMAIN = os.getenv("ZENDESK_SUBDOMAIN", "")
-
-# ===================== APP =====================
 app = FastAPI(title="CAST Ticket Analyzer")
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# ===================== CLIENTS =====================
-async_client = httpx.AsyncClient(timeout=20)
+openai_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
-@app.on_event("shutdown")
-async def shutdown():
-    await async_client.aclose()
+# ================== MODELS ==================
 
-# ===================== MODELS =====================
-class UnifiedRequest(BaseModel):
-    input: str  # ticket id OR text
+class AnalyzeRequest(BaseModel):
+    query: str
 
-# ===================== HELPERS =====================
-def zendesk_headers():
-    token = f"{ZENDESK_EMAIL}/token:{ZENDESK_API_TOKEN}"
-    encoded = base64.b64encode(token.encode()).decode()
-    return {
-        "Authorization": f"Basic {encoded}",
-        "Content-Type": "application/json",
-    }
 
-def expand_doc_query(query: str) -> str:
-    if len(query.split()) < 3:
-        return f"CAST AIP {query} rule violation analysis dashboard"
-    return f"CAST AIP {query}"
+# ================== HELPERS ==================
 
-# ===================== DOC SEARCH (FIRST) =====================
-def search_cast_docs(query: str):
+GENERIC_DOCS = [
+    {"title": "CAST AIP Documentation Home", "url": "https://doc.castsoftware.com/", "comment": "General CAST documentation"},
+]
+
+def is_ticket_id(value: str) -> bool:
+    return bool(re.fullmatch(r"\d{4,7}", value.strip()))
+
+# ================== DOC SEARCH (FIRST) ==================
+
+async def search_docs(keyword: str) -> List[Dict[str, str]]:
     docs = []
-    expanded = expand_doc_query(query)
-    q = f"{expanded} site:doc.castsoftware.com"
+    with DDGS() as ddgs:
+        for r in ddgs.text(
+            f"{keyword} site:doc.castsoftware.com",
+            max_results=5
+        ):
+            docs.append({
+                "title": r.get("title"),
+                "url": r.get("href"),
+                "comment": f"Mentions '{keyword}'"
+            })
+    return docs
 
-    try:
-        with DDGS() as ddgs:
-            for r in ddgs.text(q, max_results=8):
-                docs.append({
-                    "title": r.get("title", "CAST Documentation"),
-                    "url": r.get("href"),
-                    "comment": f"Relevant to '{query}'"
-                })
-    except Exception as e:
-        print("Doc search failed:", e)
+# ================== TICKET SEARCH (SECOND) ==================
 
-    if not docs:
-        return [{
-            "title": "CAST AIP Documentation Home",
-            "url": "https://doc.castsoftware.com/",
-            "comment": "General CAST documentation"
-        }]
+async def search_solved_tickets(keyword: str) -> List[Dict[str, Any]]:
+    """
+    Stub for Zendesk solved ticket search.
+    Replace this with real Zendesk API search.
+    """
+    return []
 
-    return docs[:3]
+# ================== AI SUMMARY (LAST) ==================
 
-# ===================== ZENDESK =====================
-async def get_ticket_comments(ticket_id: int):
-    r = await async_client.get(
-        f"https://{ZENDESK_SUBDOMAIN}.zendesk.com/api/v2/tickets/{ticket_id}/comments.json",
-        headers=zendesk_headers(),
+async def ai_summary(text: str) -> Dict[str, Any]:
+    resp = openai_client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[
+            {"role": "system", "content": "You are a CAST AIP support engineer."},
+            {"role": "user", "content": text}
+        ]
     )
-    r.raise_for_status()
-    return "\n".join(c["plain_body"] for c in r.json()["comments"])
-
-async def search_related_tickets(query: str, exclude_id: int | None):
-    zendesk_query = f"type:ticket status:solved {query}"
-    r = await async_client.get(
-        f"https://{ZENDESK_SUBDOMAIN}.zendesk.com/api/v2/search.json",
-        headers=zendesk_headers(),
-        params={"query": zendesk_query}
-    )
-    r.raise_for_status()
-
-    results = []
-    for t in r.json().get("results", []):
-        if exclude_id and t["id"] == exclude_id:
-            continue
-        results.append({
-            "id": t["id"],
-            "url": f"https://{ZENDESK_SUBDOMAIN}.zendesk.com/agent/tickets/{t['id']}",
-            "comment": t.get("description", "")[:300]
-        })
-        if len(results) == 3:
-            break
-
-    return results
-
-# ===================== AI (LAST, OPTIONAL) =====================
-def ai_analyze(text: str):
-    api_key = os.getenv("OPENAI_API_KEY")
-    if not api_key:
-        return {"summary": "", "resolution": ""}
-
-    try:
-        client = OpenAI(api_key=api_key)
-        r = client.chat.completions.create(
-            model="gpt-4o-mini",
-            temperature=0.1,
-            messages=[
-                {"role": "system", "content": "You are a CAST support expert. Summarize and give resolution."},
-                {"role": "user", "content": text},
-            ],
-        )
-        return {
-            "summary": r.choices[0].message.content,
-            "resolution": ""
-        }
-    except Exception:
-        return {"summary": "", "resolution": ""}
-
-# ===================== CORE =====================
-async def analyze_input(value: str):
-    # DOCS FIRST
-    docs = await to_thread(search_cast_docs, value)
-
-    # ticket or text?
-    if value.isdigit():
-        ticket_id = int(value)
-        comments = await get_ticket_comments(ticket_id)
-        tickets = await search_related_tickets(value, ticket_id)
-        ai = await to_thread(ai_analyze, comments)
-    else:
-        tickets = await search_related_tickets(value, None)
-        ai = await to_thread(ai_analyze, value)
-
-    confidence = round(min(0.4 + len(tickets) * 0.15, 0.9), 2)
-
     return {
-        "summary": ai.get("summary", ""),
-        "recommended_solution": ai.get("resolution", ""),
-        "confidence": confidence,
-        "related_tickets": tickets,
-        "related_docs": docs,
+        "summary": resp.choices[0].message.content.strip(),
+        "confidence": 0.85
     }
 
-# ===================== ROUTES =====================
-@app.post("/analyze")
-async def analyze(req: UnifiedRequest):
-    return await analyze_input(req.input)
+# ================== CORE ANALYSIS ==================
 
-@app.get("/ping")
-def ping():
-    return {"status": "ok"}
+async def analyze_query(query: str) -> Dict[str, Any]:
+    result = {
+        "query": query,
+        "summary": "",
+        "confidence": None,
+        "related_tickets": [],
+        "related_docs": []
+    }
 
-# ===================== UI =====================
+    # 1️⃣ DOCS FIRST
+    docs = await search_docs(query)
+    result["related_docs"] = docs if docs else GENERIC_DOCS
+
+    # 2️⃣ TICKETS
+    result["related_tickets"] = await search_solved_tickets(query)
+
+    # 3️⃣ AI SUMMARY
+    ai = await ai_summary(query)
+    result.update(ai)
+
+    return result
+
+# ================== API ==================
+
+@app.post("/ticket/analyze")
+async def analyze(req: AnalyzeRequest):
+    if not req.query:
+        raise HTTPException(status_code=400, detail="Query required")
+    return await analyze_query(req.query.strip())
+
+@app.post("/ticket/search")
+async def ticket_search(req: AnalyzeRequest):
+    return await analyze(req)
+
+@app.post("/ticket/details")
+async def ticket_details(req: AnalyzeRequest):
+    return await analyze(req)
+
+# ================== WEB UI ==================
+
 @app.get("/", response_class=HTMLResponse)
-def home():
+def ui():
     return """
 <!DOCTYPE html>
 <html>
 <head>
-<title>CAST Ticket Analyzer</title>
-<style>
-body { font-family: Arial; max-width: 900px; margin: auto; padding: 20px; }
-input,button { padding: 10px; font-size: 16px; }
-.card { background: #f9f9f9; padding: 15px; margin-top: 15px; }
-</style>
+  <title>CAST Ticket Analyzer</title>
+  <style>
+    body { font-family: Arial; margin: 40px; }
+    input { width: 300px; padding: 8px; }
+    button { padding: 8px 14px; }
+    h3 { margin-top: 30px; }
+    .item { margin-bottom: 8px; }
+  </style>
 </head>
 <body>
 
 <h2>CAST Ticket Analyzer</h2>
-<input id="q" placeholder="Ticket ID or search text" style="width:70%">
-<button onclick="run()">Analyze</button>
 
-<div id="out"></div>
+<input id="query" placeholder="Ticket ID or keywords"/>
+<button onclick="analyze()">Analyze</button>
+
+<h3>Summary</h3>
+<div id="summary">—</div>
+<div id="confidence"></div>
+
+<h3>Related Tickets</h3>
+<div id="tickets">—</div>
+
+<h3>Documentation</h3>
+<div id="docs">—</div>
 
 <script>
-async function run(){
-  out.innerHTML="Loading...";
-  const r = await fetch("/analyze",{
-    method:"POST",
-    headers:{ "Content-Type":"application/json" },
-    body: JSON.stringify({ input: q.value })
-  });
-  const d = await r.json();
+async function analyze() {
+  const q = document.getElementById("query").value;
+  document.getElementById("summary").innerText = "Loading...";
+  document.getElementById("tickets").innerHTML = "";
+  document.getElementById("docs").innerHTML = "";
 
-  out.innerHTML = `
-    <div class="card"><b>Summary</b><pre>${d.summary||""}</pre></div>
-    <div class="card"><b>Confidence:</b> ${d.confidence}</div>
-    <div class="card"><b>Related Tickets</b>${
-      (d.related_tickets||[]).map(t=>`<p><a target=_blank href="${t.url}">${t.id}</a><br>${t.comment}</p>`).join("")
-    }</div>
-    <div class="card"><b>Documentation</b>${
-      (d.related_docs||[]).map(x=>`<p><a target=_blank href="${x.url}">${x.title}</a><br>${x.comment}</p>`).join("")
-    }</div>`;
+  const res = await fetch("/ticket/analyze", {
+    method: "POST",
+    headers: {"Content-Type":"application/json"},
+    body: JSON.stringify({query:q})
+  });
+
+  const data = await res.json();
+
+  document.getElementById("summary").innerText = data.summary || "—";
+  document.getElementById("confidence").innerText =
+    data.confidence ? "Confidence: " + data.confidence : "";
+
+  const t = document.getElementById("tickets");
+  if (data.related_tickets.length === 0) t.innerText = "No related tickets";
+  data.related_tickets.forEach(x => {
+    t.innerHTML += `<div class="item">${x.id || ""} ${x.comment || ""}</div>`;
+  });
+
+  const d = document.getElementById("docs");
+  data.related_docs.forEach(x => {
+    d.innerHTML += `<div class="item">
+      <a href="${x.url}" target="_blank">${x.title}</a> – ${x.comment || ""}
+    </div>`;
+  });
 }
 </script>
+
 </body>
 </html>
 """
-
-# ===================== START =====================
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", 8080)))
