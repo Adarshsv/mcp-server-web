@@ -1,3 +1,7 @@
+@app.get("/ping")
+def ping():
+    return {"status": "ok"}
+    
 @app.get("/env")
 def env_check():
     return {
@@ -5,4 +9,5 @@ def env_check():
         "ZENDESK_API_TOKEN": "*****" if os.getenv("ZENDESK_API_TOKEN") else None,
         "ZENDESK_SUBDOMAIN": os.getenv("ZENDESK_SUBDOMAIN"),
         "OPENAI_API_KEY": "*****" if os.getenv("OPENAI_API_KEY") else None,
+        
     }
