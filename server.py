@@ -5,6 +5,7 @@ import os
 import functools
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 import httpx
 from openai import OpenAI
@@ -64,19 +65,11 @@ class QueryRequest(BaseModel):
 
 # ---------------- HELPERS ----------------
 def extract_keywords(text: str, max_words=8):
-    """
-    Extract meaningful keywords from ticket comments.
-    Uses simple regex, excludes generic words.
-    """
     words = re.findall(r"[A-Za-z][A-Za-z0-9_]{3,}", text)
     blacklist = {"error", "issue", "problem", "unable", "failed", "ticket", "please"}
     keywords = [w for w in words if w.lower() not in blacklist]
-
-    # fallback if no keywords
     if not keywords:
         keywords = ["CAST"]
-
-    # truncate to max_words
     return " ".join(keywords[:max_words])
 
 # ---------------- ZENDESK ----------------
@@ -99,10 +92,6 @@ async def get_ticket_comments(ticket_id: int):
     )
 
 async def search_related_tickets(query: str, ticket_id: int):
-    """
-    Search solved Zendesk tickets related to the query.
-    Uses OR search between keywords. Falls back to last 3 solved tickets if no matches.
-    """
     keywords = query.split() or ["CAST"]
     zendesk_query = f"type:ticket status:solved ({' OR '.join(keywords)})"
     print("Zendesk search query:", zendesk_query)
@@ -127,7 +116,6 @@ async def search_related_tickets(query: str, ticket_id: int):
             break
 
     if not related:
-        print("No related tickets found. Fetching last 3 solved tickets as fallback.")
         r = await async_client.get(
             f"https://{ZENDESK_SUBDOMAIN}.zendesk.com/api/v2/tickets.json",
             headers=zendesk_headers(),
@@ -145,15 +133,9 @@ async def search_related_tickets(query: str, ticket_id: int):
 
 # ---------------- DOC SEARCH ----------------
 def search_cast_docs(query: str):
-    """
-    Search CAST documentation using DuckDuckGo.
-    Returns top 3 docs. Fallbacks if no results.
-    """
     docs = []
     query = query.strip() or "CAST AIP"
     ddg_query = f"CAST AIP {query} site:doc.castsoftware.com"
-    print("DDG search query:", ddg_query)
-
     try:
         with DDGS() as ddgs:
             results = ddgs.text(ddg_query, max_results=5)
@@ -166,7 +148,6 @@ def search_cast_docs(query: str):
         print("DDGS search failed:", e)
 
     if not docs:
-        print("No docs found. Using fallback CAST documentation URLs.")
         fallback_docs = [
             {"title": "CAST AIP Documentation Home", "url": "https://doc.castsoftware.com/"},
             {"title": "CAST AIP Knowledge Base", "url": "https://doc.castsoftware.com/kb/"},
@@ -206,19 +187,13 @@ def ai_analyze(context: str):
 
 # ---------------- CORE ----------------
 async def analyze_ticket(ticket_id: int):
-    print(f"Analyzing ticket {ticket_id}...")
     comments = await get_ticket_comments(ticket_id)
     keywords = extract_keywords(comments)
-    print("Extracted keywords:", keywords)
-
     related_tickets = await search_related_tickets(keywords, ticket_id)
     docs = await to_thread(functools.partial(search_cast_docs, keywords))
-
     ai_context = f"TICKET COMMENTS:\n{comments}"
     ai_result = await to_thread(functools.partial(ai_analyze, ai_context))
-
     confidence = round(min(0.4 + len(related_tickets) * 0.15, 0.9), 2)
-
     return {
         "summary": ai_result["summary"],
         "recommended_solution": ai_result["resolution"],
@@ -242,6 +217,24 @@ async def ticket_details(req: TicketRequest):
     except Exception as e:
         return {"error": str(e)}
 
+# -------- NEW TEXT SEARCH ROUTE --------
+@app.post("/ticket/search")
+async def ticket_search(req: QueryRequest):
+    query = req.query.strip()
+    if not query:
+        return {"error": "Query cannot be empty"}
+    try:
+        related_tickets = await search_related_tickets(query, ticket_id=0)
+        docs = await to_thread(functools.partial(search_cast_docs, query))
+        return {
+            "query": query,
+            "related_tickets": related_tickets,
+            "related_docs": docs
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+# ---------------- PING & ENV ----------------
 @app.get("/ping")
 def ping():
     return {"status": "ok"}
@@ -255,6 +248,79 @@ def show_env():
         "OPENAI_API_KEY_set": bool(os.getenv("OPENAI_API_KEY")),
     }
 
+# ---------------- UI ----------------
+@app.get("/", response_class=HTMLResponse)
+def home():
+    return """
+<!DOCTYPE html>
+<html>
+<head>
+<title>CAST Ticket Analyzer</title>
+<style>
+body { font-family: Arial; max-width: 900px; margin: auto; padding: 20px; }
+button { padding: 10px; background: #007bff; color: white; border: none; cursor:pointer; }
+input { padding: 8px; width: 200px; margin-right: 10px; }
+.card { background: #f9f9f9; padding: 15px; margin-top: 15px; border-radius: 5px; }
+.card b { color: #333; }
+a { color: #007bff; text-decoration: none; }
+a:hover { text-decoration: underline; }
+pre { background: #eee; padding: 10px; border-radius: 3px; }
+</style>
+</head>
+<body>
+<h1>CAST Ticket Analyzer</h1>
+
+<h3>Analyze by Ticket ID</h3>
+<input id="ticket" placeholder="Ticket ID">
+<button onclick="runTicket()">Analyze Ticket</button>
+
+<h3>Search by Text</h3>
+<input id="query" placeholder="Search keywords">
+<button onclick="runSearch()">Search Tickets</button>
+
+<div id="out"></div>
+
+<script>
+async function runTicket(){
+  const id = document.getElementById("ticket").value;
+  const r = await fetch("/ticket/details",{
+    method:"POST",
+    headers:{"Content-Type":"application/json"},
+    body:JSON.stringify({ticket_id:Number(id)})
+  });
+  const d = await r.json();
+  showResult(d);
+}
+
+async function runSearch(){
+  const q = document.getElementById("query").value;
+  const r = await fetch("/ticket/search",{
+    method:"POST",
+    headers:{"Content-Type":"application/json"},
+    body:JSON.stringify({query:q})
+  });
+  const d = await r.json();
+  showResult(d);
+}
+
+function showResult(d){
+  document.getElementById("out").innerHTML = `
+    ${d.summary ? `<div class="card"><b>Summary</b><pre>${d.summary}</pre></div>` : ""}
+    ${d.recommended_solution ? `<div class="card"><b>Recommended Solution</b><pre>${d.recommended_solution}</pre></div>` : ""}
+    ${d.confidence ? `<div class="card"><b>Confidence</b>: ${d.confidence}</div>` : ""}
+    ${d.query ? `<div class="card"><b>Query</b>: ${d.query}</div>` : ""}
+    <div class="card"><b>Related Tickets</b>${
+      d.related_tickets.map(t=>`<p><a href="${t.url}" target="_blank">${t.id}</a></p>`).join("")
+    }</div>
+    <div class="card"><b>Documentation</b>${
+      d.related_docs.map(d=>`<p><a href="${d.url}" target="_blank">${d.title}</a></p>`).join("")
+    }</div>
+  `;
+}
+</script>
+</body>
+</html>
+"""
 
 # ---------------- START ----------------
 if __name__ == "__main__":
