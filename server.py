@@ -237,6 +237,15 @@ def show_env():
         "OPENAI_API_KEY_set": bool(os.getenv("OPENAI_API_KEY")),
         "OPENAI_keys": [k for k in os.environ if "OPENAI" in k],
     }
+    
+@app.get("/env/debug")
+def env_debug():
+    return {
+        "RAILWAY_SERVICE_NAME": os.getenv("RAILWAY_SERVICE_NAME"),
+        "RAILWAY_ENVIRONMENT": os.getenv("RAILWAY_ENVIRONMENT"),
+        "ALL_ENV_KEYS": sorted(list(os.environ.keys())),
+    }
+
 
 # ---------------- FRONTEND ----------------
 	
@@ -329,3 +338,6 @@ if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
     print(f"Starting CAST Ticket Analyzer on port {port}...")
     uvicorn.run(app, host="0.0.0.0", port=port)
+    
+    
+ 
