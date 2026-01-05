@@ -266,6 +266,14 @@ async function run() {
 </body>
 </html>
 """
+@app.get("/env")
+def show_env():
+    return {
+        "ZENDESK_EMAIL_set": bool(os.getenv("ZENDESK_EMAIL")),
+        "ZENDESK_API_TOKEN_set": bool(os.getenv("ZENDESK_API_TOKEN")),
+        "ZENDESK_SUBDOMAIN_set": bool(os.getenv("ZENDESK_SUBDOMAIN")),
+        "OPENAI_API_KEY_set": bool(os.getenv("OPENAI_API_KEY")),
+    }
 
 # ---------------- START ----------------
 if __name__ == "__main__":
