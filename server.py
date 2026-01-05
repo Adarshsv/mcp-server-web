@@ -190,34 +190,73 @@ def home():
 <style>
 body { font-family: Arial; max-width: 900px; margin: auto; padding: 20px; }
 button { padding: 10px; background: #007bff; color: white; border: none; cursor: pointer; }
-.card { background: #f9f9f9; padding: 15px; margin-top: 15px; }
+button:disabled { background: #aaa; cursor: not-allowed; }
+.card { background: #f9f9f9; padding: 15px; margin-top: 15px; border-radius: 6px; box-shadow: 0 2px 5px rgba(0,0,0,0.1); }
+pre { white-space: pre-wrap; word-break: break-word; }
+#error { color: red; font-weight: bold; margin-top: 10px; }
 </style>
 </head>
 <body>
 <h1>CAST Ticket Analyzer</h1>
 <input id="ticket" placeholder="Ticket ID">
-<button onclick="run()">Analyze</button>
+<button id="analyzeBtn" onclick="run()">Analyze</button>
+<div id="error"></div>
 <div id="out"></div>
+
 <script>
-async function run(){
-  const id = document.getElementById("ticket").value;
-  const r = await fetch("/ticket/details",{
-    method:"POST",
-    headers:{"Content-Type":"application/json"},
-    body:JSON.stringify({ticket_id:Number(id)})
-  });
-  const d = await r.json();
-  document.getElementById("out").innerHTML = `
-    <div class="card"><b>Summary</b><pre>${d.summary}</pre></div>
-    <div class="card"><b>Confidence</b>: ${d.confidence}</div>
-    <div class="card"><b>Recommended Solution</b><pre>${d.recommended_solution}</pre></div>
-    <div class="card"><b>Related Tickets</b>${
-      d.related_tickets.map(t=>`<p><a href="${t.url}" target="_blank">${t.id}</a></p>`).join("")
-    }</div>
-    <div class="card"><b>Documentation</b>${
-      d.related_docs.map(d=>`<p><a href="${d.url}" target="_blank">${d.title}</a></p>`).join("")
-    }</div>
-  `;
+async function run() {
+  const id = document.getElementById("ticket").value.trim();
+  const btn = document.getElementById("analyzeBtn");
+  const out = document.getElementById("out");
+  const errorDiv = document.getElementById("error");
+
+  out.innerHTML = "";
+  errorDiv.innerText = "";
+  if (!id || isNaN(id)) {
+    errorDiv.innerText = "Please enter a valid ticket ID.";
+    return;
+  }
+
+  btn.disabled = true;
+  btn.innerText = "Analyzing...";
+
+  try {
+    const r = await fetch("/ticket/details", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ ticket_id: Number(id) })
+    });
+    const d = await r.json();
+
+    if (d.error) {
+      errorDiv.innerText = d.error;
+      out.innerHTML = "";
+      return;
+    }
+
+    out.innerHTML = `
+      <div class="card"><b>Summary</b><pre>${d.summary || "N/A"}</pre></div>
+      <div class="card"><b>Confidence</b>: ${d.confidence !== undefined ? d.confidence : "N/A"}</div>
+      <div class="card"><b>Recommended Solution</b><pre>${d.recommended_solution || "N/A"}</pre></div>
+      <div class="card"><b>Related Tickets</b>${
+        d.related_tickets && d.related_tickets.length > 0
+          ? d.related_tickets.map(t => `<p><a href="${t.url}" target="_blank">${t.id}</a></p>`).join("")
+          : "<p>No related tickets found.</p>"
+      }</div>
+      <div class="card"><b>Documentation</b>${
+        d.related_docs && d.related_docs.length > 0
+          ? d.related_docs.map(doc => `<p><a href="${doc.url}" target="_blank">${doc.title}</a></p>`).join("")
+          : "<p>No related docs found.</p>"
+      }</div>
+    `;
+  } catch (err) {
+    console.error(err);
+    errorDiv.innerText = "Failed to fetch ticket details. Please check your connection or try again later.";
+    out.innerHTML = "";
+  } finally {
+    btn.disabled = false;
+    btn.innerText = "Analyze";
+  }
 }
 </script>
 </body>
