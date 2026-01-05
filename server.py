@@ -48,36 +48,33 @@ class QueryRequest(BaseModel):
 def zendesk_headers():
     auth = f"{os.getenv('ZENDESK_EMAIL')}/token:{os.getenv('ZENDESK_API_TOKEN')}"
     encoded = base64.b64encode(auth.encode()).decode()
-    return {
-        "Authorization": f"Basic {encoded}",
-        "Content-Type": "application/json",
-    }
+    return {"Authorization": f"Basic {encoded}", "Content-Type": "application/json"}
 
 async def get_ticket_comments(ticket_id: int):
-    async with httpx.AsyncClient(timeout=15) as client:
-        r = await client.get(
-            f"https://{ZENDESK_SUBDOMAIN}.zendesk.com/api/v2/tickets/{ticket_id}/comments.json",
-            headers=zendesk_headers(),
-        )
-        r.raise_for_status()
-        return "\n".join(
-            c.get("plain_body", "")
-            for c in r.json().get("comments", [])
-        )
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            r = await client.get(
+                f"https://{ZENDESK_SUBDOMAIN}.zendesk.com/api/v2/tickets/{ticket_id}/comments.json",
+                headers=zendesk_headers(),
+            )
+            r.raise_for_status()
+            return "\n".join(c.get("plain_body", "") for c in r.json().get("comments", []))
+    except Exception as e:
+        return f"[Error fetching comments: {str(e)}]"
 
 async def search_similar_tickets(query: str):
-    async with httpx.AsyncClient(timeout=15) as client:
-        r = await client.get(
-            f"https://{ZENDESK_SUBDOMAIN}.zendesk.com/api/v2/search.json",
-            headers=zendesk_headers(),
-            params={"query": f"type:ticket status:solved {query}"}
-        )
-        r.raise_for_status()
-        results = r.json().get("results", [])[:5]
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            r = await client.get(
+                f"https://{ZENDESK_SUBDOMAIN}.zendesk.com/api/v2/search.json",
+                headers=zendesk_headers(),
+                params={"query": f"type:ticket status:solved {query}"}
+            )
+            r.raise_for_status()
+            results = r.json().get("results", [])[:5]
 
         tickets = []
         resolved_context = ""
-        # fetch ticket comments concurrently
         tasks = [get_ticket_comments(t["id"]) for t in results]
         comments_list = await asyncio.gather(*tasks, return_exceptions=True)
 
@@ -90,6 +87,8 @@ async def search_similar_tickets(query: str):
             resolved_context += comment_text[-1500:]
 
         return tickets, resolved_context
+    except Exception as e:
+        return [], f"[Error fetching similar tickets: {str(e)}]"
 
 def search_cast_docs(query: str):
     docs = []
@@ -103,72 +102,83 @@ def search_cast_docs(query: str):
     return docs
 
 def ai_analyze(context: str):
-    response = ai_client.chat.completions.create(
-        model="gpt-4o-mini",
-        temperature=0.1,
-        messages=[
-            {"role": "system", "content": (
-                "You are a CAST product support expert.\n"
-                "Summarize the issue clearly and extract the concrete resolution.\n"
-                "Respond strictly in this format:\n\n"
-                "Summary:\n...\n\nResolution:\n..."
-            )},
-            {"role": "user", "content": context},
-        ],
-    )
-    text = response.choices[0].message.content.strip()
-    summary = re.search(r"Summary:(.*?)(Resolution:|$)", text, re.S)
-    resolution = re.search(r"Resolution:(.*)", text, re.S)
-    return {
-        "summary": summary.group(1).strip() if summary else text,
-        "resolution": resolution.group(1).strip() if resolution else "No clear resolution identified."
-    }
+    try:
+        response = ai_client.chat.completions.create(
+            model="gpt-4o-mini",
+            temperature=0.1,
+            messages=[
+                {"role": "system", "content": (
+                    "You are a CAST product support expert.\n"
+                    "Summarize the issue clearly and extract the concrete resolution.\n"
+                    "Respond strictly in this format:\n\n"
+                    "Summary:\n...\n\nResolution:\n..."
+                )},
+                {"role": "user", "content": context},
+            ],
+        )
+        text = response.choices[0].message.content.strip()
+        summary = re.search(r"Summary:(.*?)(Resolution:|$)", text, re.S)
+        resolution = re.search(r"Resolution:(.*)", text, re.S)
+        return {
+            "summary": summary.group(1).strip() if summary else text,
+            "resolution": resolution.group(1).strip() if resolution else "No clear resolution identified."
+        }
+    except Exception as e:
+        return {"summary": "[AI analysis failed]", "resolution": f"[Error: {str(e)}]"}
 
 # ---------------- CORE LOGIC ----------------
 async def analyze_ticket(ticket_id: int):
-    # fetch ticket comments first
-    comments = await get_ticket_comments(ticket_id)
-    snippet = comments[:200]
+    try:
+        comments = await get_ticket_comments(ticket_id)
+        snippet = comments[:200]
 
-    # run searches concurrently
-    similar_task = search_similar_tickets(snippet)
-    docs_task = to_thread(functools.partial(search_cast_docs, snippet))
-    similar_tickets, resolved_context = await similar_task
-    docs = await docs_task
+        similar_task = search_similar_tickets(snippet)
+        docs_task = to_thread(functools.partial(search_cast_docs, snippet))
+        similar_tickets, resolved_context = await similar_task
+        docs = await docs_task
 
-    ai_context = f"""
+        ai_context = f"""
 TICKET COMMENTS:
 {comments}
 
 SIMILAR RESOLVED TICKETS:
 {resolved_context}
 """
-    ai_result = await to_thread(functools.partial(ai_analyze, ai_context))
-    confidence = round(min(0.4 + len(similar_tickets) * 0.15, 0.9), 2)
+        ai_result = await to_thread(functools.partial(ai_analyze, ai_context))
+        confidence = round(min(0.4 + len(similar_tickets) * 0.15, 0.9), 2)
 
-    return {
-        "summary": ai_result["summary"],
-        "recommended_solution": ai_result["resolution"],
-        "confidence": confidence,
-        "related_tickets": similar_tickets,
-        "related_docs": docs,
-    }
+        return {
+            "summary": ai_result["summary"],
+            "recommended_solution": ai_result["resolution"],
+            "confidence": confidence,
+            "related_tickets": similar_tickets,
+            "related_docs": docs,
+        }
+    except Exception as e:
+        return {"error": f"Failed to analyze ticket: {str(e)}"}
 
 # ---------------- ROUTES ----------------
 @app.post("/ticket/details")
 async def ticket_details(req: TicketRequest):
     try:
-        return await analyze_ticket(req.ticket_id)
+        # overall timeout for slow requests (25s)
+        return await asyncio.wait_for(analyze_ticket(req.ticket_id), timeout=25)
+    except asyncio.TimeoutError:
+        return {"error": "Request timed out. Please try again later."}
     except Exception as e:
         return {"error": str(e)}
 
 @app.post("/search/docs")
 async def search_docs(req: QueryRequest):
-    return {"related_docs": await to_thread(functools.partial(search_cast_docs, req.query))}
+    try:
+        return {"related_docs": await to_thread(functools.partial(search_cast_docs, req.query))}
+    except Exception as e:
+        return {"related_docs": [], "error": str(e)}
 
 @app.get("/ping")
 def ping():
     return {"status": "ok"}
+
 
 @app.get("/", response_class=HTMLResponse)
 def home():
