@@ -20,12 +20,17 @@ REQUIRED_ENVS = [
     "OPENAI_API_KEY",
 ]
 
-missing = [e for e in REQUIRED_ENVS if not os.getenv(e)]
-if missing:
-    raise RuntimeError(f"Missing environment variables: {missing}")
+# Safe env var loading
+for e in REQUIRED_ENVS:
+    if not os.getenv(e):
+        print(f"Warning: {e} is missing. API calls may fail.")
 
-ZENDESK_SUBDOMAIN = os.getenv("ZENDESK_SUBDOMAIN")
-ai_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+ZENDESK_EMAIL = os.getenv("ZENDESK_EMAIL", "")
+ZENDESK_API_TOKEN = os.getenv("ZENDESK_API_TOKEN", "")
+ZENDESK_SUBDOMAIN = os.getenv("ZENDESK_SUBDOMAIN", "")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+
+ai_client = OpenAI(api_key=OPENAI_API_KEY)
 
 # ---------------- APP ----------------
 app = FastAPI(title="CAST Ticket Analyzer")
@@ -46,7 +51,7 @@ class QueryRequest(BaseModel):
 
 # ---------------- ZENDESK ----------------
 def zendesk_headers():
-    auth = f"{os.getenv('ZENDESK_EMAIL')}/token:{os.getenv('ZENDESK_API_TOKEN')}"
+    auth = f"{ZENDESK_EMAIL}/token:{ZENDESK_API_TOKEN}"
     encoded = base64.b64encode(auth.encode()).decode()
     return {"Authorization": f"Basic {encoded}", "Content-Type": "application/json"}
 
@@ -161,7 +166,6 @@ SIMILAR RESOLVED TICKETS:
 @app.post("/ticket/details")
 async def ticket_details(req: TicketRequest):
     try:
-        # overall timeout for slow requests (25s)
         return await asyncio.wait_for(analyze_ticket(req.ticket_id), timeout=25)
     except asyncio.TimeoutError:
         return {"error": "Request timed out. Please try again later."}
@@ -178,6 +182,19 @@ async def search_docs(req: QueryRequest):
 @app.get("/ping")
 def ping():
     return {"status": "ok"}
+
+# ---------------- FRONTEND ----------------
+@app.get("/", response_class=HTMLResponse)
+def home():
+    return "<h1>CAST Ticket Analyzer</h1><p>Use /ping or /ticket/details</p>"
+
+# ---------------- START ----------------
+if __name__ == "__main__":
+    import uvicorn
+    port = int(os.environ.get("PORT", 8080))
+    print(f"Starting CAST Ticket Analyzer on port {port}...")
+    uvicorn.run(app, host="0.0.0.0", port=port)
+
 
 
 @app.get("/", response_class=HTMLResponse)
